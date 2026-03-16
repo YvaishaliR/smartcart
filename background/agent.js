@@ -225,10 +225,16 @@ async function detectTabs() {
       if (re.test(tab.url) && !S.tabsFound[platform]) {
         S.tabsFound[platform] = tab.id;
         try {
+          // Clear the guard flag first so the script re-registers its message listener.
+          // Critical when the service worker restarts and loses its context.
+          await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            func: () => { delete window.__smartcartV7; }
+          });
           await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content/scraper.js"] });
-        } catch { /* already injected */ }
+        } catch (e) { log("warn", `Script inject failed for ${platform}: ${e?.message}`); }
         // Give the content script a moment to register its message handler
-        await sleep(500);
+        await sleep(800);
         // Ping the tab to ensure the content script is actually running and responsive
         try {
           const ping = await msgTab(tab.id, { type: "PING" }, 3000);
