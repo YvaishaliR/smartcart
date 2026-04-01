@@ -327,37 +327,78 @@
           // Real response shape: { is_success: true, response: { snippets: [ { data: { name: {text}, mrp: {text}, variant: {text}, image: {url} } } ] } }
           parse: d => {
             if (d?.is_success && d?.response?.snippets?.length > 0) {
-              return d.response.snippets;
+              // Filter out non-product snippets (banners/headers only have identity+title+bg_color+padding)
+              // Real product snippets have name, variant, atc_action etc.
+              return d.response.snippets.filter(s => {
+                const sd = s?.data || {};
+                return sd?.name?.text || sd?.atc_action || sd?.variant_list?.length > 0;
+              });
             }
-            // fallback: older shape
-            for (const w of (d?.widgets || d?.data?.widgets || [])) {
-              const items = w?.data?.objects || w?.data?.items || w?.objects || [];
-              if (items.length > 0) return items;
-            }
-            return d?.data?.objects || d?.objects || d?.products || [];
+            return [];
           },
-          norm: (p, _query) => {
-            // Real shape from network: p.data.name.text, p.data.mrp.text = "₹33", p.data.variant.text
-            if (p?.data?.name?.text) {
-              const priceStr = p.data.mrp?.text || p.data.price?.text || "";
+          norm: (snippet, query) => {
+            // Real Blinkit structure confirmed from network:
+            // snippet is one entry from response.snippets[]
+            // It may itself be a product card OR contain variant_list[] with size variants
+            //
+            // Price is in: data.atc_action.add_to_cart.cart_item.price (number)
+            // OR:          data.normal_price.text = "₹27" (display string)
+            // Name:        data.name.text
+            // Unit/size:   data.variant.text = "500 ml"
+            // Stock:       data.is_sold_out === false AND data.product_state === "available"
+            // Variants:    data.variant_list[] — different sizes of same product
+
+            const d = snippet.data || snippet;
+            if (!d?.name?.text) return { name: "", price: 0, mrp: 0, unit: "", inStock: false, img: "" };
+
+            // Helper to extract one product from a Blinkit data node
+            function extractProduct(node) {
+              const cartItem = node?.atc_action?.add_to_cart?.cart_item;
+              const price = cartItem?.price || toNum(node?.normal_price?.text) || 0;
+              const mrp = cartItem?.mrp || price;
               return {
-                name: p.data.name.text,
-                price: toNum(priceStr),
-                mrp: toNum(priceStr),
-                unit: p.data.variant?.text || "",
-                inStock: p.data.out_of_stock !== true,
-                img: p.data.image?.url || "",
+                name: node?.name?.text || node?.display_name?.text || "",
+                price: parseFloat(price),
+                mrp: parseFloat(mrp),
+                unit: node?.variant?.text || cartItem?.unit || "",
+                inStock: node?.is_sold_out === false && node?.product_state !== "sold_out",
+                img: node?.image?.url || cartItem?.image_url || "",
               };
             }
-            // Fallback for older shape
-            return {
-              name: p.name || p.product?.name || p.brand_name || "",
-              price: parseFloat(p.price || p.product?.price || p.mrp || 0),
-              mrp: parseFloat(p.mrp || p.product?.mrp || p.price || 0),
-              unit: p.quantity || p.unit || p.weight || "",
-              inStock: p.is_available !== false,
-              img: p.image || p.image_url || "",
-            };
+
+            // If variant_list exists, pick best size match (same logic as Swiggy)
+            const variantList = d.variant_list || [];
+            if (variantList.length > 0) {
+              const qtyMatch = (query || "").match(/(\d+)\s*(ml|g|kg|l|ltr|litre|gm)/i);
+              const targetQty = qtyMatch ? parseInt(qtyMatch[1]) : null;
+              const targetUnit = qtyMatch ? qtyMatch[2].toLowerCase().replace('ltr','l').replace('litre','l').replace('gm','g') : null;
+
+              let best = null;
+              let bestScore = Infinity;
+
+              for (const v of variantList) {
+                const vd = v.data || v;
+                const vUnit = (vd?.variant?.text || "").toLowerCase();
+                const vMatch = vUnit.match(/(\d+)\s*(ml|g|kg|l|ltr|litre|gm)/i);
+                if (targetQty && vMatch) {
+                  const vQty = parseInt(vMatch[1]);
+                  const vU = vMatch[2].toLowerCase().replace('ltr','l').replace('litre','l').replace('gm','g');
+                  if (vU === targetUnit) {
+                    const score = Math.abs(vQty - targetQty);
+                    if (score < bestScore) { bestScore = score; best = vd; }
+                  }
+                }
+              }
+              // Fallback: use first available variant
+              if (!best) {
+                const avail = variantList.find(v => (v.data || v)?.is_sold_out === false) || variantList[0];
+                best = avail?.data || avail;
+              }
+              if (best) return extractProduct(best);
+            }
+
+            // No variant_list — extract directly from the snippet data
+            return extractProduct(d);
           }
         }
       ],
