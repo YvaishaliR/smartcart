@@ -390,18 +390,52 @@ async function pickBest(target, candidates) {
       if (tUnit === 'l' && cUnitNorm === 'ml') { tQty = tQty * 1000; tUnit = 'ml'; }
       if (tUnit === 'ml' && cUnitNorm === 'l') { cQtyNorm = cQtyNorm * 1000; cUnitNorm = 'ml'; }
       if (tUnit !== cUnitNorm) return false; // different unit types — exclude
-      // FIX: Tighter tolerance — within 40% of target size
-      // e.g. target 48g: keeps 29g-67g, excludes 80g (67% off)
-      return Math.abs(cQtyNorm - tQty) / tQty <= 0.40;
+      // Tolerance 50% — snack/product sizes vary between platforms
+      // e.g. target 48g: keeps 24g-72g, so 67g passes but 80g (67%) excluded
+      return Math.abs(cQtyNorm - tQty) / tQty <= 0.50;
     });
     if (sizeFiltered.length > 0) {
       log("info", `  Size filter: ${candidates.length}→${sizeFiltered.length} for "${target}" (${targetQty}${targetUnit})`);
       pool = sizeFiltered;
     } else {
-      // No candidate is within 55% of target size
-      // Strictly return null — wrong size is worse than "not found"
-      log("warn", `  No size match for "${target}" (${targetQty}${targetUnit}) on any candidate: [${candidates.map(c=>c.unit||'?').join(", ")}] — marking as not found`);
-      return null;
+      // No candidate within tolerance — relax and pick closest available size
+      // Better to show nearest size than "not found" (user can verify)
+      log("warn", `  No exact size match for "${target}" (${targetQty}${targetUnit}) — picking closest from: [${candidates.map(c=>c.unit||'?').join(", ")}]`);
+      // Pick candidate with closest size in same unit type
+      const sameUnitCandidates = candidates.filter(c => {
+        const m = (c.unit || "").match(/(\d+(?:\.\d+)?)\s*(ml|g|kg|l|ltr|litre|gm|liter|gram)/i);
+        if (!m) return false;
+        const cUnit = normalizeUnit(m[2]);
+        let tUnit = targetUnit;
+        // normalize for comparison
+        if (tUnit === 'l' && cUnit === 'ml') return true; // allow cross
+        if (tUnit === 'ml' && cUnit === 'l') return true;
+        if (tUnit === 'kg' && cUnit === 'g') return true;
+        if (tUnit === 'g' && cUnit === 'kg') return true;
+        return cUnit === tUnit;
+      });
+      if (sameUnitCandidates.length > 0) {
+        // Sort by closest size
+        const closest = sameUnitCandidates.sort((a, b) => {
+          const getQty = c => {
+            const m = (c.unit||"").match(/(\d+(?:\.\d+)?)\s*(ml|g|kg|l|ltr|litre|gm)/i);
+            if (!m) return 999999;
+            let q = parseFloat(m[1]);
+            const u = normalizeUnit(m[2]);
+            if (targetUnit === 'ml' && u === 'l') q *= 1000;
+            if (targetUnit === 'l' && u === 'ml') q /= 1000;
+            if (targetUnit === 'g' && u === 'kg') q *= 1000;
+            if (targetUnit === 'kg' && u === 'g') q /= 1000;
+            return q;
+          };
+          return Math.abs(getQty(a) - targetQty) - Math.abs(getQty(b) - targetQty);
+        });
+        pool = [closest[0]]; // use only the closest
+        log("info", `  Closest size fallback: ${closest[0].unit} ${closest[0].name?.slice(0,20)}`);
+      } else {
+        log("warn", `  No same-unit candidates — marking as not found`);
+        return null;
+      }
     }
   }
 

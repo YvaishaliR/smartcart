@@ -203,14 +203,16 @@
     const cardText = card.textContent || "";
 
     // Strategy 1: quantity inside parentheses — highest priority
-    // Matches: (250 g), (1.35 L), (500ml), (2 ltr)
-    const parenMatch = cardText.match(/\(\s*(\d+(?:\.\d+)?\s*(?:g|kg|ml|L|ltr|litre|gm|liter))\s*\)/i);
-    if (parenMatch) {
-      unit = parenMatch[1].trim();
+    // Zepto shows: "1 pack (250 g)" or "1 pack (48 g or 52.9 g)"
+    // FIX: Always pick the FIRST quantity — "48 g or 52.9 g" → "48 g"
+    // Both sizes are the same product/price, first is what user selected
+    const parenContent = (cardText.match(/\(([^)]{1,40})\)/) || [])[1] || "";
+    const firstQty = parenContent.match(/(\d+(?:\.\d+)?)\s*(g|kg|ml|L|ltr|litre|gm|liter)/i);
+    if (firstQty) {
+      unit = firstQty[1] + " " + firstQty[2];
     }
 
-    // Strategy 2: look for decimal quantities specifically (like 1.35 L)
-    // These are easy to miss with simple word boundary matching
+    // Strategy 2: decimal quantities outside parens (like "1.35 L" standalone)
     if (!unit) {
       const decimalMatch = cardText.match(/(\d+\.\d+)\s*(ml|L|ltr|litre|g|kg|gm)/i);
       if (decimalMatch) unit = decimalMatch[1] + " " + decimalMatch[2];
