@@ -213,6 +213,10 @@ async function searchOnPlatform(platform) {
       : item.name.split("|")[0].trim();                    // at minimum strip the | junk
     log("info", `${platform}: searching "${searchQuery}"`);
     const res = await msgTab(S.tabsFound[platform], { type: "SEARCH_ITEM", query: searchQuery }, 11000);
+    // DEBUG: log raw results before pickBest so we can see what scraper returns
+    if (res?.results?.length > 0) {
+      log("info", `  RAW ${platform} results (${res.results.length}): ${JSON.stringify(res.results.slice(0,4).map(r=>({n:r.name?.slice(0,20),u:r.unit,p:r.price})))}`);
+    }
     if (res === null) {
       log("warn", `${platform}: SEARCH_ITEM message to tab ${S.tabsFound[platform]} timed out or failed`);
     } else if (res && res.success === false) {
@@ -221,7 +225,7 @@ async function searchOnPlatform(platform) {
     const results = res?.results || [];
 
     if (results.length > 0) {
-      const best = await pickBest(item.name, results);
+      const best = await pickBest(searchQuery, results); // pass searchQuery (has unit) not item.name
       // FIX: Guard null return from pickBest — spreading null gives {} with no price field
       if (best && best.price > 0) {
         // Store result with explicit inStock flag — used by UI to show out-of-stock warning
@@ -245,7 +249,7 @@ async function searchOnPlatform(platform) {
         const res2 = await msgTab(S.tabsFound[platform], { type: "SEARCH_ITEM", query: shortQuery }, 11000);
         const results2 = res2?.results || [];
         if (results2.length > 0) {
-          const best2 = await pickBest(item.name, results2);
+          const best2 = await pickBest(searchQuery, results2); // pass searchQuery (has unit) not item.name
           // FIX: Same null guard for short query path
           if (best2 && best2.price > 0) {
             S.prices[platform][item.name] = {
@@ -288,33 +292,45 @@ async function detectTabs() {
     for (const [platform, re] of Object.entries(TAB_PATTERNS)) {
       if (re.test(tab.url) && !S.tabsFound[platform]) {
         S.tabsFound[platform] = tab.id;
+
+        // Step 1: Clear guard flag so IIFE doesn't block re-execution
         try {
-          // Clear the guard flag first so the script re-registers its message listener.
-          // Critical when the service worker restarts and loses its context.
           await chrome.scripting.executeScript({
             target: { tabId: tab.id },
             func: () => { delete window.__smartcartV7; }
           });
-          await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content/scraper.js"] });
-        } catch (e) { log("warn", `Script inject failed for ${platform}: ${e?.message}`); }
-        // Give the content script a moment to register its message handler
-        await sleep(800);
-        // Ping the tab to ensure the content script is actually running and responsive
+        } catch (e) { log("warn", `Guard clear failed for ${platform}: ${e?.message}`); }
+
+        await sleep(150);
+
+        // Step 2: Inject scraper
         try {
-          const ping = await msgTab(tab.id, { type: "PING" }, 3000);
+          await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content/scraper.js"] });
+          log("info", `Injected scraper into ${platform} tab ${tab.id}`);
+        } catch (e) {
+          log("warn", `Inject failed for ${platform}: ${e?.message}`);
+          delete S.tabsFound[platform];
+          break;
+        }
+
+        // Step 3: Wait for script to register its message listener
+        await sleep(1000);
+
+        // Step 4: Ping to confirm it's alive
+        try {
+          const ping = await msgTab(tab.id, { type: "PING" }, 4000);
           if (!ping || ping.platform !== platform) {
-            log("warn", `Tab ${tab.id} (${tab.url}) did not respond correctly to PING for ${platform}`);
-            // don't register this tab as found if it didn't respond correctly
+            log("warn", `PING failed for ${platform} tab ${tab.id} — got: ${JSON.stringify(ping)}`);
             delete S.tabsFound[platform];
           } else {
-            log("info", `Content script active on ${platform} tab ${tab.id} (${tab.url})`);
+            log("info", `✓ ${platform} tab ${tab.id} confirmed active`);
             S.debug[platform] = { url: tab.url };
           }
         } catch (e) {
-          log("warn", `Ping failed for tab ${tab.id}: ${e?.message || e}`);
+          log("warn", `Ping error for ${platform}: ${e?.message}`);
           delete S.tabsFound[platform];
         }
-        await sleep(500);
+        await sleep(200);
         break;
       }
     }
@@ -338,60 +354,110 @@ function msgTab(tabId, message, timeout = 10000) {
 }
 
 // ── BEST MATCH ────────────────────────────────────────────────────────────────
+function normalizeUnit(u) {
+  if (!u) return null;
+  const s = u.toLowerCase().trim();
+  if (s === 'ltr' || s === 'litre' || s === 'liter') return 'l';
+  if (s === 'gm' || s === 'gram' || s === 'grams') return 'g';
+  return s;
+}
+
 async function pickBest(target, candidates) {
   if (!candidates || candidates.length === 0) return null;
 
-  // ── STEP 0: Extract target unit from the search query ─────────────────────
-  // e.g. "Godrej Fab 850 ml" → targetQty=850, targetUnit="ml"
-  const unitRe = /(\d+(?:\.\d+)?)\s*(ml|g|kg|l|ltr|litre|gm)/i;
+  // ── STEP 0: Extract target size from query ────────────────────────────────
+  // "Godrej Fab 850 ml" → targetQty=850, targetUnit="ml"
+  const unitRe = /(\d+(?:\.\d+)?)\s*(ml|g|kg|l|ltr|litre|gm|liter|gram)/i;
   const targetUnitMatch = target.match(unitRe);
   const targetQty = targetUnitMatch ? parseFloat(targetUnitMatch[1]) : null;
-  const rawUnit = targetUnitMatch ? targetUnitMatch[2].toLowerCase() : null;
-  const targetUnit = rawUnit === 'ltr' || rawUnit === 'litre' ? 'l' : rawUnit === 'gm' ? 'g' : rawUnit;
+  const targetUnit = targetUnitMatch ? normalizeUnit(targetUnitMatch[2]) : null;
 
-  // ── STEP 1: If we have a target unit, filter to size-compatible candidates ─
-  // A candidate is compatible if:
-  //   a) it has no unit info (unknown size — keep it)
-  //   b) its unit matches and size is within 50% of target
-  // This removes wildly wrong sizes like 4 ltr when we want 850 ml
+  // ── STEP 1: Size filter ───────────────────────────────────────────────────
   let pool = candidates;
+  log("info", `  pickBest: target="${target}" targetQty=${targetQty} targetUnit=${targetUnit} candidates=${candidates.length}`);
   if (targetQty && targetUnit) {
     const sizeFiltered = candidates.filter(c => {
-      const cUnit = (c.unit || "").toLowerCase();
-      if (!cUnit) return true; // no unit info, keep
-      const m = cUnit.match(/(\d+(?:\.\d+)?)\s*(ml|g|kg|l|ltr|litre|gm)/i);
-      if (!m) return true; // can't parse unit, keep
+      const cUnitRaw = (c.unit || "").toLowerCase();
+      if (!cUnitRaw) return false; // no unit info — exclude when we have a target size
+      const m = cUnitRaw.match(/(\d+(?:\.\d+)?)\s*(ml|g|kg|l|ltr|litre|gm|liter|gram)/i);
+      if (!m) return false; // unparseable unit (e.g. "1 Combo", "1 Pack") — exclude
       const cQty = parseFloat(m[1]);
-      const cU = m[2].toLowerCase() === 'ltr' || m[2].toLowerCase() === 'litre' ? 'l'
-                : m[2].toLowerCase() === 'gm' ? 'g' : m[2].toLowerCase();
-      if (cU !== targetUnit) return false; // different unit type (ml vs g) — exclude
-      // Within 60% of target size
-      return Math.abs(cQty - targetQty) / targetQty <= 0.6;
+      const cUnit = normalizeUnit(m[2]);
+      // Convert kg↔g and L↔ml for comparison
+      let tQty = targetQty, tUnit = targetUnit, cQtyNorm = cQty, cUnitNorm = cUnit;
+      if (tUnit === 'kg' && cUnitNorm === 'g') { tQty = tQty * 1000; tUnit = 'g'; }
+      if (tUnit === 'g' && cUnitNorm === 'kg') { cQtyNorm = cQtyNorm * 1000; cUnitNorm = 'g'; }
+      if (tUnit === 'l' && cUnitNorm === 'ml') { tQty = tQty * 1000; tUnit = 'ml'; }
+      if (tUnit === 'ml' && cUnitNorm === 'l') { cQtyNorm = cQtyNorm * 1000; cUnitNorm = 'ml'; }
+      if (tUnit !== cUnitNorm) return false; // different unit types — exclude
+      // FIX: Tighter tolerance — within 40% of target size
+      // e.g. target 48g: keeps 29g-67g, excludes 80g (67% off)
+      return Math.abs(cQtyNorm - tQty) / tQty <= 0.40;
     });
-    // Only use filtered pool if it has results — otherwise fall back to all candidates
     if (sizeFiltered.length > 0) {
+      log("info", `  Size filter: ${candidates.length}→${sizeFiltered.length} for "${target}" (${targetQty}${targetUnit})`);
       pool = sizeFiltered;
-      log("info", `  Size filter: ${candidates.length} → ${pool.length} candidates for "${target}"`);
+    } else {
+      // No candidate is within 55% of target size
+      // Strictly return null — wrong size is worse than "not found"
+      log("warn", `  No size match for "${target}" (${targetQty}${targetUnit}) on any candidate: [${candidates.map(c=>c.unit||'?').join(", ")}] — marking as not found`);
+      return null;
     }
   }
 
-  // ── STEP 2: Fuzzy name match within size-filtered pool ────────────────────
-  const cleanTarget = target.split("|")[0].replace(unitRe, "").trim(); // strip unit from name match
+  // ── STEP 2: Fuzzy name match + size preference ───────────────────────────
+  const cleanTarget = target.split("|")[0].replace(unitRe, "").trim();
+
+  // First try: exact size match + fuzzy name
+  if (targetQty && targetUnit) {
+    const exactSize = pool.filter(c => {
+      const m = (c.unit || "").match(/(\d+(?:\.\d+)?)\s*(ml|g|kg|l|ltr|litre|gm|liter|gram)/i);
+      if (!m) return false;
+      let cQty = parseFloat(m[1]), cUnit = normalizeUnit(m[2]);
+      let tQty = targetQty, tUnit = targetUnit;
+      if (tUnit === 'kg' && cUnit === 'g') { tQty *= 1000; tUnit = 'g'; }
+      if (tUnit === 'g' && cUnit === 'kg') { cQty *= 1000; cUnit = 'g'; }
+      if (tUnit === 'l' && cUnit === 'ml') { tQty *= 1000; tUnit = 'ml'; }
+      if (tUnit === 'ml' && cUnit === 'l') { cQty *= 1000; cUnit = 'ml'; }
+      return tUnit === cUnit && Math.abs(cQty - tQty) / tQty <= 0.10; // within 10% = exact
+    });
+    if (exactSize.length === 1) return exactSize[0]; // only one exact size — return it
+    if (exactSize.length > 1) {
+      // Multiple exact sizes — pick by name match
+      const nameMatch = exactSize.find(c => fuzzy(c.name, cleanTarget));
+      if (nameMatch) return nameMatch;
+      return exactSize[0]; // cheapest exact size
+    }
+  }
+
+  // Fallback: any fuzzy name match in pool
   const idx = pool.findIndex(c => fuzzy(c.name, cleanTarget));
   if (idx >= 0) return pool[idx];
 
-  // ── STEP 3: LLM pick from filtered pool ──────────────────────────────────
+  // ── STEP 3: LLM pick ─────────────────────────────────────────────────────
   try {
+    const llmOpts = pool.slice(0,5).map((c,i)=> i+'. '+c.name+' '+c.unit+' Rs'+c.price).join('\n');
     const r = await llm(
-      `Target: "${cleanTarget}"\nOptions:\n${pool.slice(0,5).map((c,i)=>`${i}. ${c.name} ${c.unit} ₹${c.price}`).join("\n")}\nReturn JSON only: {"i":<number>} or {"i":-1} if no match`,
+      'Target: "' + cleanTarget + '"\nOptions:\n' + llmOpts + '\nReturn JSON only: {"i":<number>} or {"i":-1} if no match',
       { max: 20, fallback: '{"i":0}' }
     );
     const p = parseJSON(r);
     if (p?.i >= 0 && p.i < pool.length) return pool[p.i];
   } catch {}
 
-  // ── STEP 4: Cheapest in-stock from filtered pool ──────────────────────────
-  return pool.filter(c => c.inStock !== false).sort((a,b) => a.price - b.price)[0] || pool[0];
+  // ── STEP 4: Closest size in-stock ────────────────────────────────────────
+  if (targetQty && targetUnit) {
+    const sorted = pool
+      .filter(c => c.inStock !== false)
+      .map(c => {
+        const m = (c.unit || "").match(/(\d+(?:\.\d+)?)\s*(ml|g|kg|l|ltr|litre|gm)/i);
+        const qty = m ? parseFloat(m[1]) : 0;
+        return { c, score: Math.abs(qty - targetQty) };
+      })
+      .sort((a, b) => a.score - b.score);
+    if (sorted.length > 0) return sorted[0].c;
+  }
+  return pool.filter(c => c.inStock !== false)[0] || pool[0];
 }
 
 // ── LLM ───────────────────────────────────────────────────────────────────────
@@ -545,14 +611,40 @@ function guardrails() {
 }
 
 // ── UTILS ──────────────────────────────────────────────────────────────────────
-function fuzzy(a,b) {
-  if(!a||!b) return false;
-  const c = s => s.toLowerCase().replace(/[^a-z0-9 ]/g,"").trim();
-  const ca=c(String(a)), cb=c(String(b));
-  if(ca===cb||ca.includes(cb)||cb.includes(ca)) return true;
-  const wa=ca.split(" ").filter(w=>w.length>2);
-  const wb=cb.split(" ").filter(w=>w.length>2);
-  return wa.length>0 && wa.filter(w=>wb.includes(w)).length/Math.max(wa.length,wb.length)>=0.5;
+function fuzzy(a, b) {
+  if (!a || !b) return false;
+  const clean = s => s.toLowerCase().replace(/[^a-z0-9 ]/g, "").trim();
+  const ca = clean(String(a)), cb = clean(String(b));
+  if (ca === cb) return true;
+  if (ca.includes(cb) || cb.includes(ca)) return true;
+
+  const wa = ca.split(" ").filter(w => w.length > 2);
+  const wb = cb.split(" ").filter(w => w.length > 2);
+  if (wa.length === 0) return false;
+
+  // Words that distinguish variants/flavours — must match if present in target
+  // e.g. "American", "Masala", "Classic", "Sour", "Spicy", "Original" etc.
+  const VARIANT_WORDS = new Set([
+    "american", "masala", "classic", "original", "sour", "spicy", "salted",
+    "sweet", "tangy", "plain", "regular", "lite", "extra", "double", "triple",
+    "mint", "lemon", "lime", "chilli", "chili", "pepper", "garlic", "onion",
+    "cream", "cheese", "butter", "chocolate", "vanilla", "strawberry", "mango",
+    "intense", "repair", "damage", "dry", "oily", "sensitive", "skincare",
+    "front", "top", "matic", "toned", "full", "skimmed",
+    "standardised", "standardized", "pasteurised", "pasteurized",
+    "lemon", "floral", "pine", "power", "plus", "ultra", "premium", "natural"
+  ]);
+
+  // Check: if target has a variant word that candidate doesn't have → not a match
+  const targetVariants = wb.filter(w => VARIANT_WORDS.has(w));
+  const candidateVariants = wa.filter(w => VARIANT_WORDS.has(w));
+  for (const tv of targetVariants) {
+    if (!wa.includes(tv)) return false; // candidate missing a key variant word
+  }
+
+  // General word overlap: at least 50% overlap
+  const overlap = wa.filter(w => wb.includes(w)).length;
+  return overlap / Math.max(wa.length, wb.length) >= 0.5;
 }
 function parseJSON(t) {
   try { const c=(t||"").replace(/```json\n?/gi,"").replace(/```/g,"").trim(); const m=c.match(/\{[\s\S]*\}/); return m?JSON.parse(m[0]):null; }
