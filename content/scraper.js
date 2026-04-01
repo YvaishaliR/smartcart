@@ -9,64 +9,8 @@
   if (window.__smartcartV7) return;
   window.__smartcartV7 = true;
 
-  // Inject a page-scoped network hook that intercepts fetch/XHR and posts details
-  (function injectNetworkHook() {
-    try {
-      const script = document.createElement('script');
-      script.textContent = `
-        (function(){
-          function send(detail){
-            try{ window.postMessage({ direction: 'SMARTCART_NET', detail }, '*'); }catch(e){}
-          }
-
-          // wrap fetch
-          const _fetch = window.fetch;
-          window.fetch = async function(input, init){
-            const method = (init && init.method) || (input && input.method) || 'GET';
-            const url = (typeof input === 'string') ? input : (input && input.url) || '';
-            const reqBody = init && init.body ? (typeof init.body === 'string' ? init.body : '[body]') : null;
-            try{
-              const resp = await _fetch.apply(this, arguments);
-              const cloned = resp.clone();
-              cloned.text().then(bodyText => {
-                send({ type: 'fetch', method, url, requestBody: reqBody, status: resp.status, statusText: resp.statusText, responseBody: bodyText.slice(0, 2000) });
-              }).catch(()=>{});
-              return resp;
-            }catch(e){ send({ type:'fetch', method, url, error: e.message }); throw e; }
-          };
-
-          // wrap XHR
-          const _xhr = window.XMLHttpRequest;
-          function WrappedXHR(){
-            const xhr = new _xhr();
-            let _method = null, _url = null, _body = null;
-            const open = xhr.open;
-            xhr.open = function(m,u){ _method = m; _url = u; return open.apply(this, arguments); };
-            const send = xhr.send;
-            xhr.send = function(b){ _body = b; try{ send.apply(this, arguments); }catch(e){} };
-            xhr.addEventListener('loadend', function(){
-              try{ const text = xhr.responseText; send({ type:'xhr', method: _method, url: _url, requestBody: _body ? '[body]' : null, status: xhr.status, responseBody: (typeof text === 'string' ? text.slice(0,2000) : '') }); }catch(e){}
-            });
-            return xhr;
-          }
-          WrappedXHR.UNSENT = _xhr.UNSENT; WrappedXHR.OPENED = _xhr.OPENED; WrappedXHR.HEADERS_RECEIVED = _xhr.HEADERS_RECEIVED; WrappedXHR.LOADING = _xhr.LOADING; WrappedXHR.DONE = _xhr.DONE;
-          window.XMLHttpRequest = WrappedXHR;
-        })();
-      `;
-      document.documentElement.appendChild(script);
-      script.parentNode.removeChild(script);
-    } catch (e) { console.warn('[SmartCart] injectNetworkHook failed', e); }
-  })();
-
-  // Listen for network messages from the page and forward to background
-  window.addEventListener('message', (ev) => {
-    if (!ev.data || ev.data.direction !== 'SMARTCART_NET') return;
-    try {
-      const entry = ev.data.detail;
-      console.log('[SmartCart NET]', entry.type, entry.method || '', entry.url || '', entry.status || entry.error || '');
-      try { chrome.runtime.sendMessage({ type: 'NET_LOG', entry }); } catch (e) { /* ignore */ }
-    } catch (e) {}
-  });
+  // NOTE: Network hook removed — injecting inline <script> tags violates Blinkit/Swiggy CSP
+  // and causes "Content Security Policy" errors that break script execution on those pages.
 
   const PLATFORM = (() => {
     const h = location.hostname;
@@ -338,6 +282,33 @@
     return [];
   }
 
+  // ── BLINKIT HEADERS (reads lat/lon from cookies — required or get 400) ─────────
+  function blinkitHeaders() {
+    // Blinkit stores lat/lon in cookies: gr_1_lat and gr_1_lon
+    // Without these, API returns {"error":"location not serviceable"}
+    function getCookie(name) {
+      const match = document.cookie.match(new RegExp('(?:^|;\s*)' + name + '=([^;]*)'));
+      return match ? decodeURIComponent(match[1]) : null;
+    }
+    const lat = getCookie('gr_1_lat') || '12.9352';   // fallback: Bengaluru center
+    const lon = getCookie('gr_1_lon') || '77.6245';
+    const deviceId = getCookie('gr_1_deviceId') || 'web';
+    const accessToken = getCookie('gr_1_accessToken') || '';
+
+    console.log('[SmartCart] Blinkit lat:', lat, 'lon:', lon);
+
+    return {
+      'app_client': 'consumer_web',
+      'app_version': '1010101010',
+      'web_app_version': '1008010016',
+      'Content-Type': 'application/json',
+      'lat': lat,
+      'lon': lon,
+      'device_id': deviceId,
+      ...(accessToken ? { 'access_token': accessToken } : {}),
+    };
+  }
+
   // ── SEARCH (Blinkit & Swiggy) ──────────────────────────────────────────────
   async function searchViaAPI(query) {
     console.log(`[SmartCart] Searching "${query}" on ${PLATFORM}`);
@@ -348,12 +319,10 @@
           // Confirmed from network: POST to v1/layout/search with these exact headers
           url: `https://blinkit.com/v1/layout/search?q=${enc(query)}&offset=0&limit=12&actual_query=${enc(query)}&search_type=auto_suggest`,
           method: "POST",
-          headers: {
-            "app_client": "consumer_web",
-            "app_version": "1010101010",
-            "web_app_version": "1008010016",
-            "Content-Type": "application/json",
-          },
+          // FIX: lat/lon are REQUIRED — without them Blinkit returns {"error":"location not serviceable"}
+          // These are read dynamically from Blinkit's own cookies (gr_1_lat, gr_1_lon) so they
+          // work for any user location, not just Bengaluru.
+          headers: blinkitHeaders(),
           body: "",  // Blinkit POST with empty body — confirmed from network (content-length: 0)
           // Real response shape: { is_success: true, response: { snippets: [ { data: { name: {text}, mrp: {text}, variant: {text}, image: {url} } } ] } }
           parse: d => {
@@ -367,7 +336,7 @@
             }
             return d?.data?.objects || d?.objects || d?.products || [];
           },
-          norm: p => {
+          norm: (p, _query) => {
             // Real shape from network: p.data.name.text, p.data.mrp.text = "₹33", p.data.variant.text
             if (p?.data?.name?.text) {
               const priceStr = p.data.mrp?.text || p.data.price?.text || "";
@@ -426,24 +395,49 @@
             }
             return items;
           },
-          norm: p => {
-            // Each item has variations[] — pick the listingVariant:true one, fallback to first
+          norm: (p, targetQuery) => {
             const variations = p?.variations || [];
-            const listing = variations.find(v => v.listingVariant === true) || variations[0];
-            if (!listing) return { name: "", price: 0, mrp: 0, unit: "", inStock: false, img: "" };
+            if (variations.length === 0) return { name: "", price: 0, mrp: 0, unit: "", inStock: false, img: "" };
 
-            // price.offerPrice.units is a STRING like "24" — must parseInt
-            const offerPrice = parseInt(listing?.price?.offerPrice?.units || "0", 10);
-            const mrpPrice = parseInt(listing?.price?.mrp?.units || "0", 10);
+            // FIX: Pick best variation by matching quantity in the search query.
+            // e.g. if Zepto item is "500ml", prefer the 500ml variant on Swiggy over 1L or 4-pack.
+            // Strategy: parse qty numbers from query, find closest matching variation.
+            const qtyMatch = (targetQuery || "").match(/(\d+)\s*(ml|g|kg|l|ltr|litre|gm|pc|pcs)/i);
+            const targetQty = qtyMatch ? parseInt(qtyMatch[1]) : null;
+            const targetUnit = qtyMatch ? qtyMatch[2].toLowerCase() : null;
+
+            let best = variations.find(v => v.listingVariant === true) || variations[0];
+
+            if (targetQty && targetUnit) {
+              // Score each variation by how close its qty is to target
+              let bestScore = Infinity;
+              for (const v of variations) {
+                const vDesc = (v.quantityDescription || "").toLowerCase();
+                const vMatch = vDesc.match(/(\d+)\s*(ml|g|kg|l|ltr|litre|gm|pc|pcs)/i);
+                if (!vMatch) continue;
+                let vQty = parseInt(vMatch[1]);
+                let vUnit = vMatch[2].toLowerCase();
+                // Normalize units for comparison
+                if (vUnit === "ltr" || vUnit === "litre") vUnit = "l";
+                if (vUnit === "gm") vUnit = "g";
+                const tUnit = targetUnit === "ltr" || targetUnit === "litre" ? "l" : targetUnit === "gm" ? "g" : targetUnit;
+                if (vUnit !== tUnit) continue; // different unit type, skip
+                const score = Math.abs(vQty - targetQty);
+                if (score < bestScore) { bestScore = score; best = v; }
+              }
+            }
+
+            const offerPrice = parseInt(best?.price?.offerPrice?.units || "0", 10);
+            const mrpPrice = parseInt(best?.price?.mrp?.units || "0", 10);
 
             return {
-              name: listing.displayName || p.displayName || "",
+              name: best.displayName || p.displayName || "",
               price: offerPrice || mrpPrice,
               mrp: mrpPrice || offerPrice,
-              unit: listing.quantityDescription || "",
-              inStock: listing?.inventory?.inStock !== false && listing?.slotInfo?.isAvail !== false,
-              img: listing.imageIds?.[0]
-                ? `https://media-assets.swiggy.com/swiggy/image/upload/fl_lossy,f_auto,q_auto,w_300/${listing.imageIds[0]}`
+              unit: best.quantityDescription || "",
+              inStock: best?.inventory?.inStock !== false && best?.slotInfo?.isAvail !== false,
+              img: best.imageIds?.[0]
+                ? `https://media-assets.swiggy.com/swiggy/image/upload/fl_lossy,f_auto,q_auto,w_300/${best.imageIds[0]}`
                 : "",
             };
           }
@@ -469,8 +463,12 @@
         };
         const reqBody = isPost ? (cfg.body ?? "") : null;
 
-        if (isCross && typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
-          // Ask background service worker to perform the fetch (has credentials + no CORS restriction)
+        // FIX: Always use the background proxy for search API calls.
+        // The isCross check was returning false (content script runs ON blinkit.com so origin matches),
+        // but direct fetch still gets 400 because the background service worker handles
+        // cookies and auth headers more reliably than the content script context.
+        const useProxy = typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage;
+        if (useProxy) {
           const pref = await proxyFetch(cfg.url, isPost ? 'POST' : 'GET', reqHeaders, reqBody);
           if (!pref || !pref.ok) { console.log('[SmartCart] proxy HTTP', pref?.status, pref?.error || ''); continue; }
           data = pref.body;
@@ -486,7 +484,7 @@
         }
         const raw = cfg.parse(data);
         if (!Array.isArray(raw) || raw.length === 0) continue;
-        const products = raw.slice(0, 8).map(cfg.norm).filter(p => p.price > 0 && p.name.length > 1);
+        const products = raw.slice(0, 8).map(p => cfg.norm(p, query)).filter(p => p.price > 0 && p.name.length > 1);
         if (products.length > 0) {
           console.log("[SmartCart]", PLATFORM, "→", products.length, "results");
           return products;

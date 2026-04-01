@@ -119,7 +119,12 @@ async function runAgent() {
     S.debug.zeptoRaw = S.zeptoCart.length;
 
     for (const item of S.zeptoCart) {
-      S.prices.zepto[item.name] = { price: item.price, name: item.name, inStock: true, img: item.img, qty: item.qty };
+      // FIX: Store UNIT price only. Some cart scrapers return the line total (price * qty).
+      // Divide by qty here so the totals calc (price * qty) doesn't double-count.
+      const unitPrice = (item.qty && item.qty > 1 && item.price > 0)
+        ? Math.round((item.price / item.qty) * 100) / 100
+        : item.price;
+      S.prices.zepto[item.name] = { price: unitPrice, name: item.name, inStock: true, img: item.img, qty: item.qty };
     }
 
     log("info", `Zepto: ${S.zeptoCart.length} items — [${S.zeptoCart.map(i=>i.name).slice(0,5).join(" | ")}]`);
@@ -211,19 +216,31 @@ async function searchOnPlatform(platform) {
 
     if (results.length > 0) {
       const best = await pickBest(item.name, results);
-      S.prices[platform][item.name] = { ...best, searchedFor: item.name };
-      log("info", `  → "${best.name}" ₹${best.price} ${best.unit ? "("+best.unit+")" : ""}`);
+      // FIX: Guard null return from pickBest — spreading null gives {} with no price field
+      if (best && best.price > 0) {
+        S.prices[platform][item.name] = { ...best, searchedFor: item.name };
+        log("info", `  → "${best.name}" ₹${best.price} ${best.unit ? "("+best.unit+")" : ""}`);
+      } else {
+        S.prices[platform][item.name] = { price: null, notFound: true, name: null };
+        log("warn", `  → pickBest returned no valid result on ${platform}`);
+      }
     } else {
-      // Try with a shorter/simplified query
-      const shortQuery = item.name.split(" ").slice(0, 3).join(" ");
+      // Try with a shorter/simplified query (first 3 meaningful words)
+      const shortQuery = item.name.split(" ").filter(w => w.length > 1).slice(0, 3).join(" ");
       if (shortQuery !== item.name) {
         log("info", `  Retry with short query: "${shortQuery}"`);
         const res2 = await msgTab(S.tabsFound[platform], { type: "SEARCH_ITEM", query: shortQuery }, 11000);
         const results2 = res2?.results || [];
         if (results2.length > 0) {
-          const best = await pickBest(item.name, results2);
-          S.prices[platform][item.name] = { ...best, searchedFor: item.name, usedShortQuery: shortQuery };
-          log("info", `  → "${best.name}" ₹${best.price} (short query match)`);
+          const best2 = await pickBest(item.name, results2);
+          // FIX: Same null guard for short query path
+          if (best2 && best2.price > 0) {
+            S.prices[platform][item.name] = { ...best2, searchedFor: item.name, usedShortQuery: shortQuery };
+            log("info", `  → "${best2.name}" ₹${best2.price} (short query match)`);
+          } else {
+            S.prices[platform][item.name] = { price: null, notFound: true, name: null };
+            log("warn", `  → short query pickBest returned no valid result on ${platform}`);
+          }
         } else {
           S.prices[platform][item.name] = { price: null, notFound: true, name: null };
           log("warn", `  → not found on ${platform}`);
@@ -252,47 +269,33 @@ async function detectTabs() {
     for (const [platform, re] of Object.entries(TAB_PATTERNS)) {
       if (re.test(tab.url) && !S.tabsFound[platform]) {
         S.tabsFound[platform] = tab.id;
-
-        // FIX: Ping first — if content script already active (from manifest auto-inject),
-        // skip re-injection. Re-injecting blindly registers a second onMessage listener
-        // which causes race conditions and silent failures on SEARCH_ITEM messages.
-        let alreadyActive = false;
         try {
-          const quickPing = await msgTab(tab.id, { type: "PING" }, 1500);
-          if (quickPing?.platform === platform) {
-            alreadyActive = true;
-            log("info", `✓ ${platform} content script already active on tab ${tab.id}`);
-          }
-        } catch {}
-
-        if (!alreadyActive) {
-          try {
-            await chrome.scripting.executeScript({
-              target: { tabId: tab.id },
-              func: () => { delete window.__smartcartV7; }
-            });
-            await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content/scraper.js"] });
-            log("info", `Injected scraper.js into ${platform} tab ${tab.id}`);
-          } catch (e) { log("warn", `Script inject failed for ${platform}: ${e?.message}`); }
-          // Give freshly injected script time to register its message listener
-          await sleep(700);
-        }
-
-        // Final confirmation ping
+          // Clear the guard flag first so the script re-registers its message listener.
+          // Critical when the service worker restarts and loses its context.
+          await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            func: () => { delete window.__smartcartV7; }
+          });
+          await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content/scraper.js"] });
+        } catch (e) { log("warn", `Script inject failed for ${platform}: ${e?.message}`); }
+        // Give the content script a moment to register its message handler
+        await sleep(800);
+        // Ping the tab to ensure the content script is actually running and responsive
         try {
           const ping = await msgTab(tab.id, { type: "PING" }, 3000);
           if (!ping || ping.platform !== platform) {
-            log("warn", `Tab ${tab.id} (${tab.url}) did not respond to PING for ${platform}`);
+            log("warn", `Tab ${tab.id} (${tab.url}) did not respond correctly to PING for ${platform}`);
+            // don't register this tab as found if it didn't respond correctly
             delete S.tabsFound[platform];
           } else {
-            log("info", `✓ ${platform} tab ${tab.id} confirmed active`);
+            log("info", `Content script active on ${platform} tab ${tab.id} (${tab.url})`);
             S.debug[platform] = { url: tab.url };
           }
         } catch (e) {
           log("warn", `Ping failed for tab ${tab.id}: ${e?.message || e}`);
           delete S.tabsFound[platform];
         }
-        await sleep(300);
+        await sleep(500);
         break;
       }
     }
