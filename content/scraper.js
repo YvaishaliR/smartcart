@@ -60,7 +60,7 @@
       const item = extractItemFromQtyAnchor(qtyEl);
       if (item && !items.find(i => i.name === item.name)) {
         items.push(item);
-        console.log("[SmartCart] ✓", item.name, "₹" + item.price, "qty:" + item.qty);
+        console.log("[SmartCart] ✓", item.name, "₹" + item.price, "qty:" + item.qty, "unit:" + item.unit);
       }
     }
 
@@ -194,19 +194,32 @@
     }
 
     // ── UNIT ──────────────────────────────────────────────────────────────────
-    // Zepto shows unit as "1 pack (250 g)" or "500 ml" or "1 kg"
-    // Priority: extract the quantity inside parentheses first e.g. (250 g) → "250 g"
-    // then fall back to standalone patterns like "500ml", "1 kg"
+    // Zepto shows units in various formats:
+    //   "1 pack (250 g)"  → want "250 g"
+    //   "1 pack (1.35 L)" → want "1.35 L"
+    //   "500 ml"          → want "500 ml"
+    //   "1 kg"            → want "1 kg"
     let unit = "";
     const cardText = card.textContent || "";
-    // First: try to find quantity inside parentheses e.g. "(250 g)" or "(500 ml)"
-    const parenMatch = cardText.match(/\(\s*(\d+(?:\.\d+)?\s*(?:g|kg|ml|L|ltr|litre|gm))\s*\)/i);
+
+    // Strategy 1: quantity inside parentheses — highest priority
+    // Matches: (250 g), (1.35 L), (500ml), (2 ltr)
+    const parenMatch = cardText.match(/\(\s*(\d+(?:\.\d+)?\s*(?:g|kg|ml|L|ltr|litre|gm|liter))\s*\)/i);
     if (parenMatch) {
       unit = parenMatch[1].trim();
-    } else {
-      // Fallback: standalone unit like "500ml", "1 kg", "250g"
-      const unitMatch = cardText.match(/\b(\d+(?:\.\d+)?\s*(?:g|kg|ml|L|ltr|litre|gm))\b/i);
-      if (unitMatch) unit = unitMatch[1].trim();
+    }
+
+    // Strategy 2: look for decimal quantities specifically (like 1.35 L)
+    // These are easy to miss with simple word boundary matching
+    if (!unit) {
+      const decimalMatch = cardText.match(/(\d+\.\d+)\s*(ml|L|ltr|litre|g|kg|gm)/i);
+      if (decimalMatch) unit = decimalMatch[1] + " " + decimalMatch[2];
+    }
+
+    // Strategy 3: standalone unit pattern
+    if (!unit) {
+      const unitMatch = cardText.match(/(\d+(?:\.\d+)?)\s*(ml|L|ltr|litre|kg|g|gm)(?![a-zA-Z])/i);
+      if (unitMatch) unit = unitMatch[1] + " " + unitMatch[2];
     }
 
     const img = card.querySelector("img")?.src || "";
