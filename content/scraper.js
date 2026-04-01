@@ -544,9 +544,73 @@
         }
         const raw = cfg.parse(data);
         if (!Array.isArray(raw) || raw.length === 0) continue;
-        const products = raw.slice(0, 8).map(p => cfg.norm(p, query)).filter(p => p.price > 0 && p.name.length > 1);
+
+        // KEY FIX: Expand ALL variants before returning so agent.js pickBest
+        // can size-filter across every available size option.
+        // Previously norm() picked ONE variant internally → pickBest saw only 1 candidate → wrong size won.
+        // Now we return ALL variants as separate candidates → pickBest picks the right size.
+        const expanded = [];
+        for (const item of raw.slice(0, 8)) {
+          const d = item.data || item;
+
+          // ── Blinkit: expand variant_list[] ──────────────────────────────
+          const variantList = d?.variant_list || [];
+          if (variantList.length > 0) {
+            for (const v of variantList) {
+              const vd = v.data || v;
+              if (!vd?.name?.text) continue;
+              const cartItem = vd?.atc_action?.add_to_cart?.cart_item;
+              const price = cartItem?.price || toNum(vd?.normal_price?.text) || 0;
+              if (price <= 0) continue;
+              const unitText = vd.variant?.text || cartItem?.unit || "";
+              // Skip multipacks unless query is also multipack
+              if (/x\s*\d+|pack\s*of\s*\d+|\d+\s*x\s*\d+/i.test(unitText) &&
+                  !/x\s*\d+|pack\s*of\s*\d+|\d+\s*x\s*\d+/i.test(query)) continue;
+              expanded.push({
+                name: vd.name.text || vd.display_name?.text || "",
+                price: parseFloat(price),
+                mrp: parseFloat(cartItem?.mrp || price),
+                unit: unitText,
+                inStock: vd.is_sold_out === false && vd.product_state !== "sold_out",
+                img: vd.image?.url || cartItem?.image_url || "",
+              });
+            }
+            if (expanded.length > 0) continue; // used variant_list, skip top-level norm
+          }
+
+          // ── Swiggy: expand variations[] ─────────────────────────────────
+          const variations = d?.variations || item?.variations || [];
+          if (variations.length > 0) {
+            for (const v of variations) {
+              const price = parseInt(v?.price?.offerPrice?.units || "0", 10);
+              const mrp = parseInt(v?.price?.mrp?.units || "0", 10);
+              if (price <= 0 && mrp <= 0) continue;
+              const unitText = v.quantityDescription || "";
+              // Skip multipacks unless query is also multipack
+              if (/x\s*\d+|pack\s*of\s*\d+|\d+\s*x\s*\d+/i.test(unitText) &&
+                  !/x\s*\d+|pack\s*of\s*\d+|\d+\s*x\s*\d+/i.test(query)) continue;
+              expanded.push({
+                name: v.displayName || d.displayName || "",
+                price: price || mrp,
+                mrp: mrp || price,
+                unit: unitText,
+                inStock: v?.inventory?.inStock !== false && v?.slotInfo?.isAvail !== false,
+                img: v.imageIds?.[0]
+                  ? `https://media-assets.swiggy.com/swiggy/image/upload/fl_lossy,f_auto,q_auto,w_300/${v.imageIds[0]}`
+                  : "",
+              });
+            }
+            if (expanded.length > 0) continue; // used variations, skip top-level norm
+          }
+
+          // ── No variants: normalize as single product ─────────────────────
+          const normed = cfg.norm(item, query);
+          if (normed.price > 0 && normed.name.length > 1) expanded.push(normed);
+        }
+
+        const products = expanded.filter(p => p.price > 0 && p.name.length > 1);
         if (products.length > 0) {
-          console.log("[SmartCart]", PLATFORM, "→", products.length, "results");
+          console.log("[SmartCart]", PLATFORM, "→", products.length, "candidates (all variants expanded)");
           return products;
         }
       } catch (e) {
