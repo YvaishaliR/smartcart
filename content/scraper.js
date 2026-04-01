@@ -194,10 +194,20 @@
     }
 
     // ── UNIT ──────────────────────────────────────────────────────────────────
-    // Look for text like "1 pc (200 ml)" or "500g" or "1 L"
+    // Zepto shows unit as "1 pack (250 g)" or "500 ml" or "1 kg"
+    // Priority: extract the quantity inside parentheses first e.g. (250 g) → "250 g"
+    // then fall back to standalone patterns like "500ml", "1 kg"
     let unit = "";
-    const unitMatch = card.textContent.match(/\d+\s*(pc|pcs|ml|g|kg|L|ltr|litre)[^)]*\)?/i);
-    if (unitMatch) unit = unitMatch[0].trim();
+    const cardText = card.textContent || "";
+    // First: try to find quantity inside parentheses e.g. "(250 g)" or "(500 ml)"
+    const parenMatch = cardText.match(/\(\s*(\d+(?:\.\d+)?\s*(?:g|kg|ml|L|ltr|litre|gm))\s*\)/i);
+    if (parenMatch) {
+      unit = parenMatch[1].trim();
+    } else {
+      // Fallback: standalone unit like "500ml", "1 kg", "250g"
+      const unitMatch = cardText.match(/\b(\d+(?:\.\d+)?\s*(?:g|kg|ml|L|ltr|litre|gm))\b/i);
+      if (unitMatch) unit = unitMatch[1].trim();
+    }
 
     const img = card.querySelector("img")?.src || "";
 
@@ -376,10 +386,14 @@
               let best = null;
               let bestScore = Infinity;
 
+              const targetIsMultipack = /x\s*\d+|pack\s*of\s*\d+|\d+\s*x\s*\d+/i.test(query || "");
               for (const v of variantList) {
                 const vd = v.data || v;
-                const vUnit = (vd?.variant?.text || "").toLowerCase();
-                const vMatch = vUnit.match(/(\d+)\s*(ml|g|kg|l|ltr|litre|gm)/i);
+                const vUnitText = (vd?.variant?.text || "").toLowerCase();
+                // Skip multi-packs if target is single unit
+                const isMultipack = /x\s*\d+|pack\s*of\s*\d+|\d+\s*x\s*\d+/i.test(vUnitText);
+                if (isMultipack && !targetIsMultipack) continue;
+                const vMatch = vUnitText.match(/(\d+)\s*(ml|g|kg|l|ltr|litre|gm)/i);
                 if (targetQty && vMatch) {
                   const vQty = parseInt(vMatch[1]);
                   const vU = vMatch[2].toLowerCase().replace('ltr','l').replace('litre','l').replace('gm','g');
@@ -451,9 +465,14 @@
 
             if (targetQty && targetUnit) {
               // Score each variation by how close its qty is to target
+              // IMPORTANT: reject multi-packs (x2, x3, pack of 2) unless target is also multi-pack
+              const targetIsMultipack = /x\s*\d+|pack\s*of\s*\d+|\d+\s*x\s*\d+/i.test(targetQuery || "");
               let bestScore = Infinity;
               for (const v of variations) {
                 const vDesc = (v.quantityDescription || "").toLowerCase();
+                // Skip multi-packs if target is single unit
+                const isMultipack = /x\s*\d+|pack\s*of\s*\d+|\d+\s*x\s*\d+/i.test(vDesc);
+                if (isMultipack && !targetIsMultipack) continue;
                 const vMatch = vDesc.match(/(\d+)\s*(ml|g|kg|l|ltr|litre|gm|pc|pcs)/i);
                 if (!vMatch) continue;
                 let vQty = parseInt(vMatch[1]);

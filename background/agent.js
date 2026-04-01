@@ -205,8 +205,14 @@ async function searchOnPlatform(platform) {
   }
 
   for (const item of S.zeptoCart) {
-    log("info", `${platform}: searching "${item.name}"`);
-    const res = await msgTab(S.tabsFound[platform], { type: "SEARCH_ITEM", query: item.name }, 11000);
+    // FIX: Append unit to search query so platforms return correct size variant first.
+    // e.g. "Taj Mahal Tea 250g" instead of "Taj Mahal Tea | Rich and Flavourful Chai"
+    // This helps both the API ranking AND our variant picker.
+    const searchQuery = item.unit
+      ? `${item.name.split("|")[0].trim()} ${item.unit}`  // strip after | and add unit
+      : item.name.split("|")[0].trim();                    // at minimum strip the | junk
+    log("info", `${platform}: searching "${searchQuery}"`);
+    const res = await msgTab(S.tabsFound[platform], { type: "SEARCH_ITEM", query: searchQuery }, 11000);
     if (res === null) {
       log("warn", `${platform}: SEARCH_ITEM message to tab ${S.tabsFound[platform]} timed out or failed`);
     } else if (res && res.success === false) {
@@ -218,15 +224,22 @@ async function searchOnPlatform(platform) {
       const best = await pickBest(item.name, results);
       // FIX: Guard null return from pickBest — spreading null gives {} with no price field
       if (best && best.price > 0) {
-        S.prices[platform][item.name] = { ...best, searchedFor: item.name };
-        log("info", `  → "${best.name}" ₹${best.price} ${best.unit ? "("+best.unit+")" : ""}`);
+        // Store result with explicit inStock flag — used by UI to show out-of-stock warning
+        S.prices[platform][item.name] = {
+          ...best,
+          searchedFor: item.name,
+          inStock: best.inStock !== false,  // preserve inStock from scraper
+        };
+        const stockWarn = best.inStock === false ? " ⚠️ OUT OF STOCK" : "";
+        log("info", `  → "${best.name}" ₹${best.price} ${best.unit ? "("+best.unit+")" : ""}${stockWarn}`);
       } else {
         S.prices[platform][item.name] = { price: null, notFound: true, name: null };
         log("warn", `  → pickBest returned no valid result on ${platform}`);
       }
     } else {
       // Try with a shorter/simplified query (first 3 meaningful words)
-      const shortQuery = item.name.split(" ").filter(w => w.length > 1).slice(0, 3).join(" ");
+      // Use first 3 words of the cleaned name (already stripped of | content)
+      const shortQuery = searchQuery.split(" ").filter(w => w.length > 1).slice(0, 3).join(" ");
       if (shortQuery !== item.name) {
         log("info", `  Retry with short query: "${shortQuery}"`);
         const res2 = await msgTab(S.tabsFound[platform], { type: "SEARCH_ITEM", query: shortQuery }, 11000);
@@ -235,8 +248,14 @@ async function searchOnPlatform(platform) {
           const best2 = await pickBest(item.name, results2);
           // FIX: Same null guard for short query path
           if (best2 && best2.price > 0) {
-            S.prices[platform][item.name] = { ...best2, searchedFor: item.name, usedShortQuery: shortQuery };
-            log("info", `  → "${best2.name}" ₹${best2.price} (short query match)`);
+            S.prices[platform][item.name] = {
+              ...best2,
+              searchedFor: item.name,
+              usedShortQuery: shortQuery,
+              inStock: best2.inStock !== false,
+            };
+            const stockWarn2 = best2.inStock === false ? " ⚠️ OUT OF STOCK" : "";
+            log("info", `  → "${best2.name}" ₹${best2.price} (short query match)${stockWarn2}`);
           } else {
             S.prices[platform][item.name] = { price: null, notFound: true, name: null };
             log("warn", `  → short query pickBest returned no valid result on ${platform}`);
@@ -320,22 +339,59 @@ function msgTab(tabId, message, timeout = 10000) {
 
 // ── BEST MATCH ────────────────────────────────────────────────────────────────
 async function pickBest(target, candidates) {
-  // First: exact/fuzzy name match
-  const idx = candidates.findIndex(c => fuzzy(c.name, target));
-  if (idx >= 0) return candidates[idx];
+  if (!candidates || candidates.length === 0) return null;
 
-  // Second: LLM pick
+  // ── STEP 0: Extract target unit from the search query ─────────────────────
+  // e.g. "Godrej Fab 850 ml" → targetQty=850, targetUnit="ml"
+  const unitRe = /(\d+(?:\.\d+)?)\s*(ml|g|kg|l|ltr|litre|gm)/i;
+  const targetUnitMatch = target.match(unitRe);
+  const targetQty = targetUnitMatch ? parseFloat(targetUnitMatch[1]) : null;
+  const rawUnit = targetUnitMatch ? targetUnitMatch[2].toLowerCase() : null;
+  const targetUnit = rawUnit === 'ltr' || rawUnit === 'litre' ? 'l' : rawUnit === 'gm' ? 'g' : rawUnit;
+
+  // ── STEP 1: If we have a target unit, filter to size-compatible candidates ─
+  // A candidate is compatible if:
+  //   a) it has no unit info (unknown size — keep it)
+  //   b) its unit matches and size is within 50% of target
+  // This removes wildly wrong sizes like 4 ltr when we want 850 ml
+  let pool = candidates;
+  if (targetQty && targetUnit) {
+    const sizeFiltered = candidates.filter(c => {
+      const cUnit = (c.unit || "").toLowerCase();
+      if (!cUnit) return true; // no unit info, keep
+      const m = cUnit.match(/(\d+(?:\.\d+)?)\s*(ml|g|kg|l|ltr|litre|gm)/i);
+      if (!m) return true; // can't parse unit, keep
+      const cQty = parseFloat(m[1]);
+      const cU = m[2].toLowerCase() === 'ltr' || m[2].toLowerCase() === 'litre' ? 'l'
+                : m[2].toLowerCase() === 'gm' ? 'g' : m[2].toLowerCase();
+      if (cU !== targetUnit) return false; // different unit type (ml vs g) — exclude
+      // Within 60% of target size
+      return Math.abs(cQty - targetQty) / targetQty <= 0.6;
+    });
+    // Only use filtered pool if it has results — otherwise fall back to all candidates
+    if (sizeFiltered.length > 0) {
+      pool = sizeFiltered;
+      log("info", `  Size filter: ${candidates.length} → ${pool.length} candidates for "${target}"`);
+    }
+  }
+
+  // ── STEP 2: Fuzzy name match within size-filtered pool ────────────────────
+  const cleanTarget = target.split("|")[0].replace(unitRe, "").trim(); // strip unit from name match
+  const idx = pool.findIndex(c => fuzzy(c.name, cleanTarget));
+  if (idx >= 0) return pool[idx];
+
+  // ── STEP 3: LLM pick from filtered pool ──────────────────────────────────
   try {
     const r = await llm(
-      `Target: "${target}"\nOptions:\n${candidates.slice(0,5).map((c,i)=>`${i}. ${c.name} ₹${c.price}`).join("\n")}\nReturn JSON only: {"i":<number>} or {"i":-1} if no match`,
+      `Target: "${cleanTarget}"\nOptions:\n${pool.slice(0,5).map((c,i)=>`${i}. ${c.name} ${c.unit} ₹${c.price}`).join("\n")}\nReturn JSON only: {"i":<number>} or {"i":-1} if no match`,
       { max: 20, fallback: '{"i":0}' }
     );
     const p = parseJSON(r);
-    if (p?.i >= 0 && p.i < candidates.length) return candidates[p.i];
+    if (p?.i >= 0 && p.i < pool.length) return pool[p.i];
   } catch {}
 
-  // Third: cheapest in-stock
-  return candidates.filter(c => c.inStock !== false).sort((a,b) => a.price - b.price)[0] || candidates[0];
+  // ── STEP 4: Cheapest in-stock from filtered pool ──────────────────────────
+  return pool.filter(c => c.inStock !== false).sort((a,b) => a.price - b.price)[0] || pool[0];
 }
 
 // ── LLM ───────────────────────────────────────────────────────────────────────
@@ -392,10 +448,21 @@ function buildComparison() {
     for (const p of platforms) {
       const d = S.prices[p][item.name];
       if (d?.price && d.price > 0) {
-        row[p] = { price: d.price, name: d.name, available: true, unit: d.unit || "" };
-        if (d.price < minPrice) { minPrice = d.price; cheapest = p; }
+        const inStock = d.inStock !== false;
+        row[p] = {
+          price: d.price,
+          name: d.name,
+          available: true,
+          inStock,
+          unit: d.unit || "",
+          // Out of stock items still shown but flagged — don't count toward cheapest
+          outOfStock: !inStock,
+        };
+        // Only count in-stock items for cheapest calculation
+        if (inStock && d.price < minPrice) { minPrice = d.price; cheapest = p; }
       } else {
-        row[p] = { available: false, reason: d?.noTab ? "tab not open" : d?.notFound ? "not found" : "N/A" };
+        const reason = d?.noTab ? "Tab not open" : d?.notFound ? "Not found" : "N/A";
+        row[p] = { available: false, inStock: false, reason };
       }
     }
     row.cheapest = cheapest;
@@ -409,8 +476,14 @@ function buildComparison() {
     let sum = 0, found = 0, missing = 0;
     for (const item of items) {
       const d = S.prices[p][item.name];
-      if (d?.price > 0) { sum += d.price * (item.qty || 1); found++; }
-      else missing++;
+      if (d?.price > 0 && d?.inStock !== false) {
+        sum += d.price * (item.qty || 1); found++;
+      } else if (d?.price > 0 && d?.inStock === false) {
+        // Out of stock — count as missing for total purposes
+        missing++;
+      } else {
+        missing++;
+      }
     }
     totals[p] = { subtotal: Math.round(sum*100)/100, itemsFound: found, itemsMissing: missing, offers: S.offers[p] || [] };
   }
