@@ -9,6 +9,65 @@
   if (window.__smartcartV7) return;
   window.__smartcartV7 = true;
 
+  // Inject a page-scoped network hook that intercepts fetch/XHR and posts details
+  (function injectNetworkHook() {
+    try {
+      const script = document.createElement('script');
+      script.textContent = `
+        (function(){
+          function send(detail){
+            try{ window.postMessage({ direction: 'SMARTCART_NET', detail }, '*'); }catch(e){}
+          }
+
+          // wrap fetch
+          const _fetch = window.fetch;
+          window.fetch = async function(input, init){
+            const method = (init && init.method) || (input && input.method) || 'GET';
+            const url = (typeof input === 'string') ? input : (input && input.url) || '';
+            const reqBody = init && init.body ? (typeof init.body === 'string' ? init.body : '[body]') : null;
+            try{
+              const resp = await _fetch.apply(this, arguments);
+              const cloned = resp.clone();
+              cloned.text().then(bodyText => {
+                send({ type: 'fetch', method, url, requestBody: reqBody, status: resp.status, statusText: resp.statusText, responseBody: bodyText.slice(0, 2000) });
+              }).catch(()=>{});
+              return resp;
+            }catch(e){ send({ type:'fetch', method, url, error: e.message }); throw e; }
+          };
+
+          // wrap XHR
+          const _xhr = window.XMLHttpRequest;
+          function WrappedXHR(){
+            const xhr = new _xhr();
+            let _method = null, _url = null, _body = null;
+            const open = xhr.open;
+            xhr.open = function(m,u){ _method = m; _url = u; return open.apply(this, arguments); };
+            const send = xhr.send;
+            xhr.send = function(b){ _body = b; try{ send.apply(this, arguments); }catch(e){} };
+            xhr.addEventListener('loadend', function(){
+              try{ const text = xhr.responseText; send({ type:'xhr', method: _method, url: _url, requestBody: _body ? '[body]' : null, status: xhr.status, responseBody: (typeof text === 'string' ? text.slice(0,2000) : '') }); }catch(e){}
+            });
+            return xhr;
+          }
+          WrappedXHR.UNSENT = _xhr.UNSENT; WrappedXHR.OPENED = _xhr.OPENED; WrappedXHR.HEADERS_RECEIVED = _xhr.HEADERS_RECEIVED; WrappedXHR.LOADING = _xhr.LOADING; WrappedXHR.DONE = _xhr.DONE;
+          window.XMLHttpRequest = WrappedXHR;
+        })();
+      `;
+      document.documentElement.appendChild(script);
+      script.parentNode.removeChild(script);
+    } catch (e) { console.warn('[SmartCart] injectNetworkHook failed', e); }
+  })();
+
+  // Listen for network messages from the page and forward to background
+  window.addEventListener('message', (ev) => {
+    if (!ev.data || ev.data.direction !== 'SMARTCART_NET') return;
+    try {
+      const entry = ev.data.detail;
+      console.log('[SmartCart NET]', entry.type, entry.method || '', entry.url || '', entry.status || entry.error || '');
+      try { chrome.runtime.sendMessage({ type: 'NET_LOG', entry }); } catch (e) { /* ignore */ }
+    } catch (e) {}
+  });
+
   const PLATFORM = (() => {
     const h = location.hostname;
     if (h.includes("zeptonow") || h.includes("zepto")) return "zepto";
@@ -286,66 +345,108 @@
     const CONFIGS = {
       blinkit: [
         {
-          url: `https://blinkit.com/v2/products/search?q=${enc(query)}&start=0&size=10`,
-          parse: d => d?.response?.products?.objects || d?.products || [],
-          norm: p => ({
-            name: p.name || p.brand_name || "",
-            price: parseFloat(p.price || p.mrp || 0),
-            mrp: parseFloat(p.mrp || p.price || 0),
-            unit: p.quantity || p.unit || "",
-            inStock: p.is_available !== false,
-            img: p.image || "",
-          })
-        },
-        {
-          url: `https://blinkit.com/v6/listings/page/?q=${enc(query)}`,
+          // Confirmed from network: POST to v1/layout/search with these exact headers
+          url: `https://blinkit.com/v1/layout/search?q=${enc(query)}&offset=0&limit=12&actual_query=${enc(query)}&search_type=auto_suggest`,
+          method: "POST",
+          headers: {
+            "app_client": "consumer_web",
+            "app_version": "1010101010",
+            "web_app_version": "1008010016",
+            "Content-Type": "application/json",
+          },
+          body: "",  // Blinkit POST with empty body — confirmed from network (content-length: 0)
+          // Real response shape: { is_success: true, response: { snippets: [ { data: { name: {text}, mrp: {text}, variant: {text}, image: {url} } } ] } }
           parse: d => {
-            for (const w of (d?.data?.widgets || d?.widgets || [])) {
-              const items = w?.data?.items || w?.items || [];
+            if (d?.is_success && d?.response?.snippets?.length > 0) {
+              return d.response.snippets;
+            }
+            // fallback: older shape
+            for (const w of (d?.widgets || d?.data?.widgets || [])) {
+              const items = w?.data?.objects || w?.data?.items || w?.objects || [];
               if (items.length > 0) return items;
             }
-            return [];
+            return d?.data?.objects || d?.objects || d?.products || [];
           },
-          norm: p => ({
-            name: p.name || p.product?.name || "",
-            price: parseFloat(p.price || p.product?.price || 0),
-            mrp: parseFloat(p.mrp || p.product?.mrp || 0),
-            unit: p.weight || "",
-            inStock: true,
-            img: p.image_url || "",
-          })
+          norm: p => {
+            // Real shape from network: p.data.name.text, p.data.mrp.text = "₹33", p.data.variant.text
+            if (p?.data?.name?.text) {
+              const priceStr = p.data.mrp?.text || p.data.price?.text || "";
+              return {
+                name: p.data.name.text,
+                price: toNum(priceStr),
+                mrp: toNum(priceStr),
+                unit: p.data.variant?.text || "",
+                inStock: p.data.out_of_stock !== true,
+                img: p.data.image?.url || "",
+              };
+            }
+            // Fallback for older shape
+            return {
+              name: p.name || p.product?.name || p.brand_name || "",
+              price: parseFloat(p.price || p.product?.price || p.mrp || 0),
+              mrp: parseFloat(p.mrp || p.product?.mrp || p.price || 0),
+              unit: p.quantity || p.unit || p.weight || "",
+              inStock: p.is_available !== false,
+              img: p.image || p.image_url || "",
+            };
+          }
         }
       ],
       swiggy: [
         {
-          url: `https://www.swiggy.com/mapi/instamart/search?query=${enc(query)}&offset=0&limit=10&pageType=INSTAMART_HOME_PAGE`,
-          parse: d => {
-            for (const w of (d?.data?.widgets || [])) {
-              const prods = w?.data?.products || w?.products || [];
-              if (prods.length > 0) return prods;
-            }
-            return d?.data?.products || [];
+          // Confirmed from network: POST with exact URL and body shape
+          // storeId 1395425 confirmed from your cookies (Bengaluru/Marathahalli)
+          url: `https://www.swiggy.com/api/instamart/search/v2?offset=0&ageConsent=false&voiceSearchTrackingId=&storeId=1395425&primaryStoreId=1395425&secondaryStoreId=1400609`,
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "origin": "https://www.swiggy.com",
           },
-          norm: p => ({
-            name: p.display_name || p.name || "",
-            price: parseFloat(p.offer_price || p.price || p.mrp || 0),
-            mrp: parseFloat(p.mrp || p.price || 0),
-            unit: p.weight || p.pack_desc || "",
-            inStock: p.is_available !== false,
-            img: p.product_image || p.image || "",
-          })
-        },
-        {
-          url: `https://www.swiggy.com/api/instamart/v4/search?searchString=${enc(query)}&pageNumber=0`,
-          parse: d => d?.data?.products || d?.data?.listings || [],
-          norm: p => ({
-            name: p.display_name || p.name || "",
-            price: parseFloat(p.offer_price || p.price || p.mrp || 0),
-            mrp: parseFloat(p.mrp || p.price || 0),
-            unit: p.weight || "",
-            inStock: p.is_available !== false,
-            img: p.product_image || p.image || "",
-          })
+          body: JSON.stringify({
+            facets: [],
+            sortAttribute: "",
+            query: query,
+            search_results_offset: "0",
+            page_type: "INSTAMART_AUTO_SUGGEST_PAGE",
+            is_pre_search_tag: false,
+          }),
+          // Real response shape confirmed:
+          // data.cards[].card.card.gridElements.infoWithStyle.items[]
+          // Each item: { displayName, variations: [{ listingVariant, displayName, quantityDescription, price: { offerPrice: { units: "24" } }, inventory: { inStock } }] }
+          parse: d => {
+            const items = [];
+            for (const card of (d?.data?.cards || [])) {
+              const inner = card?.card?.card;
+              if (!inner) continue;
+              // Products live under gridElements.infoWithStyle.items
+              const gridItems = inner?.gridElements?.infoWithStyle?.items;
+              if (Array.isArray(gridItems) && gridItems.length > 0) {
+                items.push(...gridItems);
+              }
+            }
+            return items;
+          },
+          norm: p => {
+            // Each item has variations[] — pick the listingVariant:true one, fallback to first
+            const variations = p?.variations || [];
+            const listing = variations.find(v => v.listingVariant === true) || variations[0];
+            if (!listing) return { name: "", price: 0, mrp: 0, unit: "", inStock: false, img: "" };
+
+            // price.offerPrice.units is a STRING like "24" — must parseInt
+            const offerPrice = parseInt(listing?.price?.offerPrice?.units || "0", 10);
+            const mrpPrice = parseInt(listing?.price?.mrp?.units || "0", 10);
+
+            return {
+              name: listing.displayName || p.displayName || "",
+              price: offerPrice || mrpPrice,
+              mrp: mrpPrice || offerPrice,
+              unit: listing.quantityDescription || "",
+              inStock: listing?.inventory?.inStock !== false && listing?.slotInfo?.isAvail !== false,
+              img: listing.imageIds?.[0]
+                ? `https://media-assets.swiggy.com/swiggy/image/upload/fl_lossy,f_auto,q_auto,w_300/${listing.imageIds[0]}`
+                : "",
+            };
+          }
         }
       ]
     };
@@ -353,17 +454,36 @@
     const configs = CONFIGS[PLATFORM] || [];
     for (const cfg of configs) {
       try {
-        console.log("[SmartCart] →", cfg.url.split("?")[0]);
-        const res = await fetch(cfg.url, {
-          credentials: "include",
-          headers: {
-            "Accept": "application/json, */*",
-            "Accept-Language": "en-IN,en;q=0.9",
-            "X-Requested-With": "XMLHttpRequest",
-          }
-        });
-        if (!res.ok) { console.log("[SmartCart] HTTP", res.status); continue; }
-        const data = await res.json();
+        const isPost = cfg.method === "POST";
+        console.log("[SmartCart] →", cfg.method || "GET", cfg.url.split("?")[0]);
+        // Use background proxy for cross-origin requests (content scripts are limited by CORS)
+        const isCross = (() => {
+          try { return new URL(cfg.url, location.origin).origin !== location.origin; } catch { return false; }
+        })();
+        let data = null;
+        // Merge base headers with platform-specific headers from cfg
+        const reqHeaders = {
+          'Accept': 'application/json, */*',
+          'Accept-Language': 'en-IN,en;q=0.9',
+          ...(cfg.headers || {}),
+        };
+        const reqBody = isPost ? (cfg.body ?? "") : null;
+
+        if (isCross && typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
+          // Ask background service worker to perform the fetch (has credentials + no CORS restriction)
+          const pref = await proxyFetch(cfg.url, isPost ? 'POST' : 'GET', reqHeaders, reqBody);
+          if (!pref || !pref.ok) { console.log('[SmartCart] proxy HTTP', pref?.status, pref?.error || ''); continue; }
+          data = pref.body;
+        } else {
+          const res = await fetch(cfg.url, {
+            method: isPost ? "POST" : "GET",
+            credentials: "include",
+            headers: reqHeaders,
+            ...(isPost ? { body: reqBody } : {}),
+          });
+          if (!res.ok) { console.log("[SmartCart] HTTP", res.status); continue; }
+          data = await res.json();
+        }
         const raw = cfg.parse(data);
         if (!Array.isArray(raw) || raw.length === 0) continue;
         const products = raw.slice(0, 8).map(cfg.norm).filter(p => p.price > 0 && p.name.length > 1);
@@ -403,6 +523,16 @@
 
   function enc(q) { return encodeURIComponent(q); }
 
+  // Proxy fetch helper: ask background service worker to perform cross-origin fetch
+  function proxyFetch(url, method = 'GET', headers = {}, body = null) {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage({ type: 'PROXY_FETCH', url, method, headers, body }, resp => {
+          resolve(resp);
+        });
+      } catch (e) { resolve({ ok: false, error: e.message }); }
+    });
+  }
   function scrapeOffers() {
     const seen = new Set(), offers = [];
     document.querySelectorAll('[class*="offer" i],[class*="coupon" i],[class*="promo" i]')
@@ -416,10 +546,14 @@
   // Conservative HTML-search fallback: fetch the site's public search page and
   // parse product cards. This helps when the JSON API endpoints change/return 404.
   async function htmlSearchFallback(query) {
-    const tryPaths = [
+    // Each platform uses a different search URL structure
+    const SEARCH_PATHS = {
+      blinkit: [`/s/?q=${enc(query)}`],
+      swiggy:  [`/instamart/search?custom_back=true&query=${enc(query)}`],
+    };
+    const tryPaths = SEARCH_PATHS[PLATFORM] || [
       `/search?q=${enc(query)}`,
       `/search/?q=${enc(query)}`,
-      `/search/${enc(query)}`,
     ];
 
     for (const p of tryPaths) {
@@ -468,7 +602,28 @@
   // DOM and then parse product cards. This avoids calling JSON APIs directly.
   async function pageSearchFallback(query) {
     const candidates = [];
+
+    // Platform-specific selectors first, then generic fallbacks
+    const PLATFORM_SELECTORS = {
+      blinkit: [
+        'input[data-testid="search-input"]',
+        'input[placeholder*="Search" i]',
+        '.search-bar input',
+        'input[class*="Search"]',
+        'header input',
+      ],
+      swiggy: [
+        'input[data-testid="search_input"]',
+        'input[placeholder*="Search" i]',
+        'input[placeholder*="search" i]',
+        'div[class*="SearchBar"] input',
+        'div[class*="search"] input',
+        'header input',
+      ],
+    };
+
     const inputSelectors = [
+      ...(PLATFORM_SELECTORS[PLATFORM] || []),
       'input[type="search"]',
       'input[placeholder*="Search" i]',
       'input[aria-label*="Search" i]',
@@ -476,7 +631,7 @@
       'input[role="search"]',
       '.search-input input',
       '.SearchBar input',
-      'input[class*="search"]'
+      'input[class*="search" i]',
     ];
 
     let input = null;
@@ -486,6 +641,20 @@
     }
 
     if (!input) {
+      // No search input visible — try navigating to the search URL directly
+      // This works for Blinkit (/s/?q=) and Swiggy (/instamart/search?query=)
+      const NAV_URLS = {
+        blinkit: `/s/?q=${enc(query)}`,
+        swiggy:  `/instamart/search?custom_back=true&query=${enc(query)}`,
+      };
+      const navUrl = NAV_URLS[PLATFORM];
+      if (navUrl) {
+        console.log('[SmartCart] Navigating to search URL:', navUrl);
+        history.pushState({}, '', navUrl);
+        window.dispatchEvent(new PopStateEvent('popstate', { state: {} }));
+        const found = await waitForResultsInDOM(7000);
+        if (found && found.length > 0) return found.slice(0, 8);
+      }
       console.log('[SmartCart] No visible search input found on page for in-page fallback');
       return [];
     }
@@ -519,43 +688,64 @@
   function waitForResultsInDOM(timeout = 5000) {
     return new Promise(resolve => {
       const start = Date.now();
-      const parseNow = () => {
-        const nodes = Array.from(document.querySelectorAll('article, li, div'));
+
+      // Platform-specific product card selectors — more precise than generic div/li
+      const RESULT_SELECTORS = {
+        blinkit: [
+          '[class*="Product__UpdatedPlpProductContainer"]',
+          '[class*="plp-product"]',
+          '[data-testid*="plp-product"]',
+          '[class*="SearchResults"] [class*="product"]',
+        ],
+        swiggy: [
+          '[class*="SearchResultItem"]',
+          '[class*="ItemRevamp"]',
+          '[data-testid*="item"]',
+          '[class*="search"] [class*="Item"]',
+        ],
+      };
+
+      const selectors = RESULT_SELECTORS[PLATFORM] || [];
+
+      const parseNodes = (nodes) => {
         const out = [];
         for (const node of nodes) {
           try {
-            if (!node.querySelector) continue;
-            const img = node.querySelector('img');
-            if (!img) continue;
             const text = node.textContent || '';
             if (!/₹/.test(text)) continue;
             const priceMatch = text.match(/₹\s*(\d+[\d,]*(?:\.\d+)?)/);
             if (!priceMatch) continue;
             const price = toNum(priceMatch[0]);
-            const name = (text.replace(/\s+/g, ' ').trim().slice(0, 140));
-            out.push({ name, price, mrp: price, unit: '', inStock: true, img: img.src || '' });
+            const img = node.querySelector('img');
+            out.push({ name: text.replace(/\s+/g, ' ').trim().slice(0, 100), price, mrp: price, unit: '', inStock: true, img: img?.src || '' });
             if (out.length >= 8) break;
-          } catch (e) {}
+          } catch {}
         }
         return out;
       };
 
-      const initial = parseNow();
-      if (initial.length > 0) return resolve(initial);
+      const parseNow = () => {
+        // Try platform-specific selectors first (avoids navbar/banner false positives)
+        for (const sel of selectors) {
+          const nodes = Array.from(document.querySelectorAll(sel));
+          if (nodes.length > 0) {
+            const out = parseNodes(nodes);
+            if (out.length > 0) return out;
+          }
+        }
+        // Generic fallback scoped to main content area only
+        const nodes = Array.from(document.querySelectorAll('main article, main li, [role="main"] > div > div'));
+        return parseNodes(nodes);
+      };
 
+      // Don't check immediately — only fire on DOM mutations (prevents pre-existing content false positive)
       const obs = new MutationObserver(() => {
         const curr = parseNow();
-        if (curr.length > 0) {
-          obs.disconnect();
-          resolve(curr);
-        } else if (Date.now() - start > timeout) {
-          obs.disconnect();
-          resolve([]);
-        }
+        if (curr.length > 0) { obs.disconnect(); resolve(curr); }
+        else if (Date.now() - start > timeout) { obs.disconnect(); resolve([]); }
       });
       obs.observe(document.body, { childList: true, subtree: true });
-      // fallback timeout
-      setTimeout(() => { try { obs.disconnect(); } catch {} ; resolve([]); }, timeout + 50);
+      setTimeout(() => { try { obs.disconnect(); } catch {} resolve([]); }, timeout + 100);
     });
   }
 

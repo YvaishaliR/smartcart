@@ -34,6 +34,34 @@ function setPlan(id, status) {
 
 // ── MESSAGES ──────────────────────────────────────────────────────────────────
 chrome.runtime.onMessage.addListener((msg, _, sendResponse) => {
+  // Proxy fetch: allow content scripts to request cross-origin resources
+  if (msg.type === 'PROXY_FETCH') {
+    (async () => {
+      try {
+        const opts = { method: msg.method || 'GET', headers: msg.headers || {}, credentials: 'include' };
+        if (msg.body) opts.body = msg.body;
+        const r = await fetch(msg.url, opts);
+        const text = await r.text();
+        let body = text;
+        try { body = JSON.parse(text); } catch {}
+        sendResponse({ ok: r.ok, status: r.status, statusText: r.statusText, body });
+      } catch (e) {
+        sendResponse({ ok: false, error: e.message });
+      }
+    })();
+    return true; // keep channel open for async response
+  }
+  if (msg.type === 'NET_LOG') {
+    try {
+      S.debug = S.debug || {};
+      S.debug.networkLogs = S.debug.networkLogs || [];
+      S.debug.networkLogs.push({ ts: Date.now(), entry: msg.entry });
+      if (S.debug.networkLogs.length > 200) S.debug.networkLogs.shift();
+      log('info', `NET_LOG ${msg.entry.type} ${msg.entry.method||''} ${msg.entry.url||''} ${msg.entry.status||msg.entry.error||''}`);
+      sendResponse({ ok: true });
+    } catch (e) { sendResponse({ ok: false, error: e.message }); }
+    return true;
+  }
   if (msg.type === "START_AGENT") {
     runAgent().then(() => sendResponse({ ok: true })).catch(e => sendResponse({ error: e.message }));
     return true;
@@ -224,33 +252,47 @@ async function detectTabs() {
     for (const [platform, re] of Object.entries(TAB_PATTERNS)) {
       if (re.test(tab.url) && !S.tabsFound[platform]) {
         S.tabsFound[platform] = tab.id;
+
+        // FIX: Ping first — if content script already active (from manifest auto-inject),
+        // skip re-injection. Re-injecting blindly registers a second onMessage listener
+        // which causes race conditions and silent failures on SEARCH_ITEM messages.
+        let alreadyActive = false;
         try {
-          // Clear the guard flag first so the script re-registers its message listener.
-          // Critical when the service worker restarts and loses its context.
-          await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
-            func: () => { delete window.__smartcartV7; }
-          });
-          await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content/scraper.js"] });
-        } catch (e) { log("warn", `Script inject failed for ${platform}: ${e?.message}`); }
-        // Give the content script a moment to register its message handler
-        await sleep(800);
-        // Ping the tab to ensure the content script is actually running and responsive
+          const quickPing = await msgTab(tab.id, { type: "PING" }, 1500);
+          if (quickPing?.platform === platform) {
+            alreadyActive = true;
+            log("info", `✓ ${platform} content script already active on tab ${tab.id}`);
+          }
+        } catch {}
+
+        if (!alreadyActive) {
+          try {
+            await chrome.scripting.executeScript({
+              target: { tabId: tab.id },
+              func: () => { delete window.__smartcartV7; }
+            });
+            await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content/scraper.js"] });
+            log("info", `Injected scraper.js into ${platform} tab ${tab.id}`);
+          } catch (e) { log("warn", `Script inject failed for ${platform}: ${e?.message}`); }
+          // Give freshly injected script time to register its message listener
+          await sleep(700);
+        }
+
+        // Final confirmation ping
         try {
           const ping = await msgTab(tab.id, { type: "PING" }, 3000);
           if (!ping || ping.platform !== platform) {
-            log("warn", `Tab ${tab.id} (${tab.url}) did not respond correctly to PING for ${platform}`);
-            // don't register this tab as found if it didn't respond correctly
+            log("warn", `Tab ${tab.id} (${tab.url}) did not respond to PING for ${platform}`);
             delete S.tabsFound[platform];
           } else {
-            log("info", `Content script active on ${platform} tab ${tab.id} (${tab.url})`);
+            log("info", `✓ ${platform} tab ${tab.id} confirmed active`);
             S.debug[platform] = { url: tab.url };
           }
         } catch (e) {
           log("warn", `Ping failed for tab ${tab.id}: ${e?.message || e}`);
           delete S.tabsFound[platform];
         }
-        await sleep(500);
+        await sleep(300);
         break;
       }
     }
