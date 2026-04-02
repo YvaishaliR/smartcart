@@ -206,7 +206,6 @@ async function searchOnPlatform(platform) {
 
   for (const item of S.zeptoCart) {
     // FIX: Append unit to search query so platforms return correct size variant first.
-    // e.g. "Taj Mahal Tea 250g" instead of "Taj Mahal Tea | Rich and Flavourful Chai"
     // This helps both the API ranking AND our variant picker.
     const searchQuery = item.unit
       ? `${item.name.split("|")[0].trim()} ${item.unit}`  // strip after | and add unit
@@ -366,7 +365,7 @@ async function pickBest(target, candidates) {
   if (!candidates || candidates.length === 0) return null;
 
   // ── STEP 0: Extract target size from query ────────────────────────────────
-  // "Godrej Fab 850 ml" → targetQty=850, targetUnit="ml"
+  
   const unitRe = /(\d+(?:\.\d+)?)\s*(ml|g|kg|l|ltr|litre|gm|liter|gram)/i;
   const targetUnitMatch = target.match(unitRe);
   const targetQty = targetUnitMatch ? parseFloat(targetUnitMatch[1]) : null;
