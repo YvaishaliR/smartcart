@@ -2,7 +2,6 @@
 // Flow: Scrape Zepto cart panel → Search each item on Blinkit & Swiggy → Compare
 importScripts("config.js");
 
-
 let S = {
   status: "idle",
   zeptoCart: [],
@@ -15,7 +14,7 @@ let S = {
   error: null,
   llmProvider: "none",
   tabsFound: {},
-  debug: {},  // extra debug info shown in UI
+  debug: {},
 };
 
 // ── LOGGING ───────────────────────────────────────────────────────────────────
@@ -36,7 +35,6 @@ function setPlan(id, status) {
 
 // ── MESSAGES ──────────────────────────────────────────────────────────────────
 chrome.runtime.onMessage.addListener((msg, _, sendResponse) => {
-  // Proxy fetch: allow content scripts to request cross-origin resources
   if (msg.type === 'PROXY_FETCH') {
     (async () => {
       try {
@@ -51,7 +49,7 @@ chrome.runtime.onMessage.addListener((msg, _, sendResponse) => {
         sendResponse({ ok: false, error: e.message });
       }
     })();
-    return true; // keep channel open for async response
+    return true;
   }
   if (msg.type === 'NET_LOG') {
     try {
@@ -121,8 +119,6 @@ async function runAgent() {
     S.debug.zeptoRaw = S.zeptoCart.length;
 
     for (const item of S.zeptoCart) {
-      // FIX: Store UNIT price only. Some cart scrapers return the line total (price * qty).
-      // Divide by qty here so the totals calc (price * qty) doesn't double-count.
       const unitPrice = (item.qty && item.qty > 1 && item.price > 0)
         ? Math.round((item.price / item.qty) * 100) / 100
         : item.price;
@@ -155,23 +151,25 @@ async function runAgent() {
     await searchOnPlatform("swiggy");
     setPlan(5, "done");
 
-    // 6. Compare
+    // 6. Compare — math first, LLM only adds summary text
     setPlan(6, "active");
     S.status = "comparing";
     bcastState();
-    S.comparison = buildComparison();
+    S.comparison = buildComparison(); // ← this does the real math, never overridden
 
-    // Try LLM enhancement
+    // LLM only writes a friendly summary — it CANNOT change bestPlatform or savings
     try {
-      const llmRes = await llm(buildPrompt(), { max: 800 });
+      const llmRes = await llm(buildPrompt(), { max: 200 });
       const parsed = parseJSON(llmRes);
-      if (parsed?.recommendation?.bestPlatform) {
-        S.comparison.recommendation = { ...S.comparison.recommendation, ...parsed.recommendation };
-        if (parsed.summary) S.comparison.summary = parsed.summary;
+      if (parsed?.summary) {
+        S.comparison.summary = parsed.summary;         // ✅ only take summary text
         S.comparison.llmEnhanced = true;
-        log("info", `LLM enhanced ✓ (${S.llmProvider})`);
+        log("info", `LLM summary added ✓ (${S.llmProvider})`);
       }
-    } catch {}
+      // ❌ never do: S.comparison.recommendation = { ...parsed.recommendation }
+    } catch (e) {
+      log("warn", `LLM summary failed: ${e.message}`);
+    }
 
     log("info", `Best: ${S.comparison.recommendation?.bestPlatform} | Save ₹${S.comparison.recommendation?.totalSavings}`);
     setPlan(6, "done");
@@ -207,33 +205,28 @@ async function searchOnPlatform(platform) {
   }
 
   for (const item of S.zeptoCart) {
-    // FIX: Append unit to search query so platforms return correct size variant first.
-    // This helps both the API ranking AND our variant picker.
     const searchQuery = item.unit
-      ? `${item.name.split("|")[0].trim()} ${item.unit}`  // strip after | and add unit
-      : item.name.split("|")[0].trim();                    // at minimum strip the | junk
+      ? `${item.name.split("|")[0].trim()} ${item.unit}`
+      : item.name.split("|")[0].trim();
     log("info", `${platform}: searching "${searchQuery}"`);
     const res = await msgTab(S.tabsFound[platform], { type: "SEARCH_ITEM", query: searchQuery }, 11000);
-    // DEBUG: log raw results before pickBest so we can see what scraper returns
     if (res?.results?.length > 0) {
       log("info", `  RAW ${platform} results (${res.results.length}): ${JSON.stringify(res.results.slice(0,4).map(r=>({n:r.name?.slice(0,20),u:r.unit,p:r.price})))}`);
     }
     if (res === null) {
-      log("warn", `${platform}: SEARCH_ITEM message to tab ${S.tabsFound[platform]} timed out or failed`);
+      log("warn", `${platform}: SEARCH_ITEM timed out for tab ${S.tabsFound[platform]}`);
     } else if (res && res.success === false) {
-      log("warn", `${platform}: SEARCH_ITEM handler returned error: ${res.error || 'unknown'}`);
+      log("warn", `${platform}: SEARCH_ITEM error: ${res.error || 'unknown'}`);
     }
     const results = res?.results || [];
 
     if (results.length > 0) {
-      const best = await pickBest(searchQuery, results); // pass searchQuery (has unit) not item.name
-      // FIX: Guard null return from pickBest — spreading null gives {} with no price field
+      const best = await pickBest(searchQuery, results);
       if (best && best.price > 0) {
-        // Store result with explicit inStock flag — used by UI to show out-of-stock warning
         S.prices[platform][item.name] = {
           ...best,
           searchedFor: item.name,
-          inStock: best.inStock !== false,  // preserve inStock from scraper
+          inStock: best.inStock !== false,
         };
         const stockWarn = best.inStock === false ? " ⚠️ OUT OF STOCK" : "";
         log("info", `  → "${best.name}" ₹${best.price} ${best.unit ? "("+best.unit+")" : ""}${stockWarn}`);
@@ -242,16 +235,13 @@ async function searchOnPlatform(platform) {
         log("warn", `  → pickBest returned no valid result on ${platform}`);
       }
     } else {
-      // Try with a shorter/simplified query (first 3 meaningful words)
-      // Use first 3 words of the cleaned name (already stripped of | content)
       const shortQuery = searchQuery.split(" ").filter(w => w.length > 1).slice(0, 3).join(" ");
       if (shortQuery !== item.name) {
         log("info", `  Retry with short query: "${shortQuery}"`);
         const res2 = await msgTab(S.tabsFound[platform], { type: "SEARCH_ITEM", query: shortQuery }, 11000);
         const results2 = res2?.results || [];
         if (results2.length > 0) {
-          const best2 = await pickBest(searchQuery, results2); // pass searchQuery (has unit) not item.name
-          // FIX: Same null guard for short query path
+          const best2 = await pickBest(searchQuery, results2);
           if (best2 && best2.price > 0) {
             S.prices[platform][item.name] = {
               ...best2,
@@ -294,7 +284,6 @@ async function detectTabs() {
       if (re.test(tab.url) && !S.tabsFound[platform]) {
         S.tabsFound[platform] = tab.id;
 
-        // Step 1: Clear guard flag so IIFE doesn't block re-execution
         try {
           await chrome.scripting.executeScript({
             target: { tabId: tab.id },
@@ -304,7 +293,6 @@ async function detectTabs() {
 
         await sleep(150);
 
-        // Step 2: Inject scraper
         try {
           await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content/scraper.js"] });
           log("info", `Injected scraper into ${platform} tab ${tab.id}`);
@@ -314,10 +302,8 @@ async function detectTabs() {
           break;
         }
 
-        // Step 3: Wait for script to register its message listener
         await sleep(1000);
 
-        // Step 4: Ping to confirm it's alive
         try {
           const ping = await msgTab(tab.id, { type: "PING" }, 4000);
           if (!ping || ping.platform !== platform) {
@@ -366,57 +352,58 @@ function normalizeUnit(u) {
 async function pickBest(target, candidates) {
   if (!candidates || candidates.length === 0) return null;
 
-  // ── STEP 0: Extract target size from query ────────────────────────────────
-  
   const unitRe = /(\d+(?:\.\d+)?)\s*(ml|g|kg|l|ltr|litre|gm|liter|gram)/i;
   const targetUnitMatch = target.match(unitRe);
   const targetQty = targetUnitMatch ? parseFloat(targetUnitMatch[1]) : null;
   const targetUnit = targetUnitMatch ? normalizeUnit(targetUnitMatch[2]) : null;
 
-  // ── STEP 1: Size filter ───────────────────────────────────────────────────
   let pool = candidates;
+
+// FIX: exclude multipacks (2 x 100g, 5 x 125g etc.) when target is a single unit
+const targetIsMultipack = /\d+\s*x\s*\d+|pack\s*of\s*\d+|\d+\s*pack/i.test(target);
+if (!targetIsMultipack) {
+  const noMultipacks = candidates.filter(c => 
+    !/\d+\s*x\s*\d+|pack\s*of\s*\d+|\d+\s*pack/i.test(c.unit || "")
+  );
+  if (noMultipacks.length > 0) {
+    candidates = noMultipacks;  // only filter out if alternatives exist
+    log("info", `  Multipack filter: removed ${pool.length - noMultipacks.length} multipacks`);
+  }
+}
   log("info", `  pickBest: target="${target}" targetQty=${targetQty} targetUnit=${targetUnit} candidates=${candidates.length}`);
   if (targetQty && targetUnit) {
     const sizeFiltered = candidates.filter(c => {
       const cUnitRaw = (c.unit || "").toLowerCase();
-      if (!cUnitRaw) return false; // no unit info — exclude when we have a target size
+      if (!cUnitRaw) return false;
       const m = cUnitRaw.match(/(\d+(?:\.\d+)?)\s*(ml|g|kg|l|ltr|litre|gm|liter|gram)/i);
-      if (!m) return false; // unparseable unit (e.g. "1 Combo", "1 Pack") — exclude
+      if (!m) return false;
       const cQty = parseFloat(m[1]);
       const cUnit = normalizeUnit(m[2]);
-      // Convert kg↔g and L↔ml for comparison
       let tQty = targetQty, tUnit = targetUnit, cQtyNorm = cQty, cUnitNorm = cUnit;
       if (tUnit === 'kg' && cUnitNorm === 'g') { tQty = tQty * 1000; tUnit = 'g'; }
       if (tUnit === 'g' && cUnitNorm === 'kg') { cQtyNorm = cQtyNorm * 1000; cUnitNorm = 'g'; }
       if (tUnit === 'l' && cUnitNorm === 'ml') { tQty = tQty * 1000; tUnit = 'ml'; }
       if (tUnit === 'ml' && cUnitNorm === 'l') { cQtyNorm = cQtyNorm * 1000; cUnitNorm = 'ml'; }
-      if (tUnit !== cUnitNorm) return false; // different unit types — exclude
-      // Tolerance 50% — snack/product sizes vary between platforms
-      // e.g. target 48g: keeps 24g-72g, so 67g passes but 80g (67%) excluded
+      if (tUnit !== cUnitNorm) return false;
       return Math.abs(cQtyNorm - tQty) / tQty <= 0.50;
     });
     if (sizeFiltered.length > 0) {
       log("info", `  Size filter: ${candidates.length}→${sizeFiltered.length} for "${target}" (${targetQty}${targetUnit})`);
       pool = sizeFiltered;
     } else {
-      // No candidate within tolerance — relax and pick closest available size
-      // Better to show nearest size than "not found" (user can verify)
       log("warn", `  No exact size match for "${target}" (${targetQty}${targetUnit}) — picking closest from: [${candidates.map(c=>c.unit||'?').join(", ")}]`);
-      // Pick candidate with closest size in same unit type
       const sameUnitCandidates = candidates.filter(c => {
         const m = (c.unit || "").match(/(\d+(?:\.\d+)?)\s*(ml|g|kg|l|ltr|litre|gm|liter|gram)/i);
         if (!m) return false;
         const cUnit = normalizeUnit(m[2]);
         let tUnit = targetUnit;
-        // normalize for comparison
-        if (tUnit === 'l' && cUnit === 'ml') return true; // allow cross
+        if (tUnit === 'l' && cUnit === 'ml') return true;
         if (tUnit === 'ml' && cUnit === 'l') return true;
         if (tUnit === 'kg' && cUnit === 'g') return true;
         if (tUnit === 'g' && cUnit === 'kg') return true;
         return cUnit === tUnit;
       });
       if (sameUnitCandidates.length > 0) {
-        // Sort by closest size
         const closest = sameUnitCandidates.sort((a, b) => {
           const getQty = c => {
             const m = (c.unit||"").match(/(\d+(?:\.\d+)?)\s*(ml|g|kg|l|ltr|litre|gm)/i);
@@ -431,7 +418,7 @@ async function pickBest(target, candidates) {
           };
           return Math.abs(getQty(a) - targetQty) - Math.abs(getQty(b) - targetQty);
         });
-        pool = [closest[0]]; // use only the closest
+        pool = [closest[0]];
         log("info", `  Closest size fallback: ${closest[0].unit} ${closest[0].name?.slice(0,20)}`);
       } else {
         log("warn", `  No same-unit candidates — marking as not found`);
@@ -440,10 +427,8 @@ async function pickBest(target, candidates) {
     }
   }
 
-  // ── STEP 2: Fuzzy name match + size preference ───────────────────────────
   const cleanTarget = target.split("|")[0].replace(unitRe, "").trim();
 
-  // First try: exact size match + fuzzy name
   if (targetQty && targetUnit) {
     const exactSize = pool.filter(c => {
       const m = (c.unit || "").match(/(\d+(?:\.\d+)?)\s*(ml|g|kg|l|ltr|litre|gm|liter|gram)/i);
@@ -454,22 +439,20 @@ async function pickBest(target, candidates) {
       if (tUnit === 'g' && cUnit === 'kg') { cQty *= 1000; cUnit = 'g'; }
       if (tUnit === 'l' && cUnit === 'ml') { tQty *= 1000; tUnit = 'ml'; }
       if (tUnit === 'ml' && cUnit === 'l') { cQty *= 1000; cUnit = 'ml'; }
-      return tUnit === cUnit && Math.abs(cQty - tQty) / tQty <= 0.10; // within 10% = exact
+      return tUnit === cUnit && Math.abs(cQty - tQty) / tQty <= 0.10;
     });
-    if (exactSize.length === 1) return exactSize[0]; // only one exact size — return it
+    if (exactSize.length === 1) return exactSize[0];
     if (exactSize.length > 1) {
-      // Multiple exact sizes — pick by name match
       const nameMatch = exactSize.find(c => fuzzy(c.name, cleanTarget));
       if (nameMatch) return nameMatch;
-      return exactSize[0]; // cheapest exact size
+      return exactSize[0];
     }
   }
 
-  // Fallback: any fuzzy name match in pool
   const idx = pool.findIndex(c => fuzzy(c.name, cleanTarget));
   if (idx >= 0) return pool[idx];
 
-  // ── STEP 3: LLM pick ─────────────────────────────────────────────────────
+  // LLM pick for product matching (this is fine — it's just choosing an index, not changing prices)
   try {
     const llmOpts = pool.slice(0,5).map((c,i)=> i+'. '+c.name+' '+c.unit+' Rs'+c.price).join('\n');
     const r = await llm(
@@ -480,7 +463,6 @@ async function pickBest(target, candidates) {
     if (p?.i >= 0 && p.i < pool.length) return pool[p.i];
   } catch {}
 
-  // ── STEP 4: Closest size in-stock ────────────────────────────────────────
   if (targetQty && targetUnit) {
     const sorted = pool
       .filter(c => c.inStock !== false)
@@ -499,34 +481,41 @@ async function pickBest(target, candidates) {
 async function llm(prompt, opts = {}) {
   const max = opts.max || 600;
 
-  // Groq free
-try {
-  const key = typeof CONFIG !== "undefined" && CONFIG.YOUR_KEY;
-if (!key) throw new Error("No Groq key");
-  const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST",
-    headers: { 
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${key}`
-    },
-    body: JSON.stringify({
-      model: "llama-3.1-8b-instant",  // free, very fast
-      max_tokens: max,
-      messages: [
-        { role: "system", content: "Grocery price comparison AI for India. Return only JSON when asked." },
-        { role: "user", content: prompt }
-      ]
-    })
-  });
-  if (r.ok) {
-    const d = await r.json();
-    const t = d?.choices?.[0]?.message?.content;
-    if (t) { S.llmProvider = "Groq Llama"; return t; }
+  // 1. Groq (free, fast) ─────────────────────────────────────────────────────
+  try {
+    const key = typeof CONFIG !== "undefined" && CONFIG.GROQ_API_KEY;  // ← must match config.js
+    if (!key) throw new Error("No Groq key");
+    log("info", "Trying Groq...");
+    const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${key}`           // ← backticks, not quotes
+      },
+      body: JSON.stringify({
+        model: "llama-3.1-8b-instant",
+        max_tokens: max,
+        messages: [
+          { role: "system", content: "Grocery price comparison AI for India. Return only JSON when asked, no markdown." },
+          { role: "user", content: prompt }
+        ]
+      })
+    });
+    if (r.ok) {
+      const d = await r.json();
+      const t = d?.choices?.[0]?.message?.content;
+      if (t) { S.llmProvider = "Groq Llama"; log("info", "Groq success ✓"); return t; }
+    } else {
+      const errText = await r.text();
+      log("warn", `Groq error ${r.status}: ${errText.slice(0, 120)}`);
+    }
+  } catch (e) {
+    log("warn", `Groq fetch failed: ${e.message}`);
   }
-} catch {}
 
-    try {
-      const key = (typeof CONFIG !== "undefined") && CONFIG.ANTHROPIC_API_KEY;
+  // 2. Claude (if you top up credits) ───────────────────────────────────────
+  try {
+    const key = typeof CONFIG !== "undefined" && CONFIG.ANTHROPIC_API_KEY;
     if (key) {
       const r = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
@@ -556,7 +545,7 @@ if (!key) throw new Error("No Groq key");
     log("warn", `Claude fetch failed: ${e.message}`);
   }
 
-  // Chrome Gemini Nano (free, on-device)
+  // 3. Chrome Gemini Nano (on-device, no key needed) ─────────────────────────
   try {
     if (self.ai?.languageModel) {
       const cap = await self.ai.languageModel.capabilities();
@@ -570,27 +559,8 @@ if (!key) throw new Error("No Groq key");
     }
   } catch {}
 
-  // OpenRouter free
-  try {
-    const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "HTTP-Referer": "chrome-extension://smartcart" },
-      body: JSON.stringify({
-        model: "google/gemma-3-4b-it:free",
-        max_tokens: max,
-        messages: [
-          { role: "system", content: "Grocery price comparison AI for India. Return only JSON when asked." },
-          { role: "user", content: prompt }
-        ]
-      })
-    });
-    if (r.ok) {
-      const d = await r.json();
-      const t = d?.choices?.[0]?.message?.content;
-      if (t) { S.llmProvider = "OpenRouter Gemma 3"; return t; }
-    }
-  } catch {}
-
+  // 4. Rule-based fallback ───────────────────────────────────────────────────
+  log("warn", "All LLMs failed — using rule-based fallback");
   S.llmProvider = "Rule-based";
   return opts.fallback || "OK";
 }
@@ -613,10 +583,8 @@ function buildComparison() {
           available: true,
           inStock,
           unit: d.unit || "",
-          // Out of stock items still shown but flagged — don't count toward cheapest
           outOfStock: !inStock,
         };
-        // Only count in-stock items for cheapest calculation
         if (inStock && d.price < minPrice) { minPrice = d.price; cheapest = p; }
       } else {
         const reason = d?.noTab ? "Tab not open" : d?.notFound ? "Not found" : "N/A";
@@ -636,9 +604,6 @@ function buildComparison() {
       const d = S.prices[p][item.name];
       if (d?.price > 0 && d?.inStock !== false) {
         sum += d.price * (item.qty || 1); found++;
-      } else if (d?.price > 0 && d?.inStock === false) {
-        // Out of stock — count as missing for total purposes
-        missing++;
       } else {
         missing++;
       }
@@ -676,15 +641,20 @@ function buildComparison() {
   };
 }
 
+// LLM is only asked for a friendly summary — the winner is already decided by math above
 function buildPrompt() {
+  const best = S.comparison.recommendation.bestPlatform;
+  const savings = S.comparison.recommendation.totalSavings;
+  const totals = S.comparison.platformTotals;
+
   const rows = S.zeptoCart.slice(0,10).map(item => {
     const z = S.prices.zepto[item.name];
     const b = S.prices.blinkit[item.name];
     const sw = S.prices.swiggy[item.name];
-    return `${item.name}: Zepto=₹${z?.price||"N/A"} | Blinkit=₹${b?.price||"N/A"}(${b?.name||"?"}) | Swiggy=₹${sw?.price||"N/A"}(${sw?.name||"?"})`;
+    return `${item.name}: Zepto=₹${z?.price||"N/A"} | Blinkit=₹${b?.price||"N/A"} | Swiggy=₹${sw?.price||"N/A"}`;
   }).join("\n");
 
-  return `Grocery price comparison for Indian user. Items:\n${rows}\n\nReturn JSON only (no markdown):\n{"recommendation":{"bestPlatform":"blinkit","reason":"one sentence","totalSavings":45,"confidence":"high"},"summary":"2 sentence summary"}`;
+  return `Grocery cart prices (India):\n${rows}\n\nZepto total: ₹${totals.zepto?.subtotal||"N/A"}\nBlinkit total: ₹${totals.blinkit?.subtotal||"N/A"}\nSwiggy total: ₹${totals.swiggy?.subtotal||"N/A"}\n\nThe cheapest platform is ${cap(best)}${savings > 0 ? `, saving ₹${savings}` : ""}. Write a short 1-2 sentence friendly summary for the user confirming this.\n\nReturn JSON only, no markdown: {"summary":"..."}`;
 }
 
 // ── GUARDRAILS ─────────────────────────────────────────────────────────────────
@@ -714,8 +684,6 @@ function fuzzy(a, b) {
   const wb = cb.split(" ").filter(w => w.length > 2);
   if (wa.length === 0) return false;
 
-  // Words that distinguish variants/flavours — must match if present in target
-  // e.g. "American", "Masala", "Classic", "Sour", "Spicy", "Original" etc.
   const VARIANT_WORDS = new Set([
     "american", "masala", "classic", "original", "sour", "spicy", "salted",
     "sweet", "tangy", "plain", "regular", "lite", "extra", "double", "triple",
@@ -724,23 +692,24 @@ function fuzzy(a, b) {
     "intense", "repair", "damage", "dry", "oily", "sensitive", "skincare",
     "front", "top", "matic", "toned", "full", "skimmed",
     "standardised", "standardized", "pasteurised", "pasteurized",
-    "lemon", "floral", "pine", "power", "plus", "ultra", "premium", "natural"
+    "floral", "pine", "power", "plus", "ultra", "premium", "natural"
   ]);
 
-  // Check: if target has a variant word that candidate doesn't have → not a match
   const targetVariants = wb.filter(w => VARIANT_WORDS.has(w));
-  const candidateVariants = wa.filter(w => VARIANT_WORDS.has(w));
   for (const tv of targetVariants) {
-    if (!wa.includes(tv)) return false; // candidate missing a key variant word
+    if (!wa.includes(tv)) return false;
   }
 
-  // General word overlap: at least 50% overlap
   const overlap = wa.filter(w => wb.includes(w)).length;
   return overlap / Math.max(wa.length, wb.length) >= 0.5;
 }
+
 function parseJSON(t) {
-  try { const c=(t||"").replace(/```json\n?/gi,"").replace(/```/g,"").trim(); const m=c.match(/\{[\s\S]*\}/); return m?JSON.parse(m[0]):null; }
-  catch { return null; }
+  try {
+    const c = (t||"").replace(/```json\n?/gi,"").replace(/```/g,"").trim();
+    const m = c.match(/\{[\s\S]*\}/);
+    return m ? JSON.parse(m[0]) : null;
+  } catch { return null; }
 }
-function cap(s) { return s?s.charAt(0).toUpperCase()+s.slice(1):""; }
-function sleep(ms) { return new Promise(r=>setTimeout(r,ms)); }
+function cap(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : ""; }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
