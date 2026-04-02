@@ -1,4 +1,4 @@
-# 🛒 SmartCart AI — Grocery Price Comparison Agent
+# 🛒 BlinkLess  — Grocery Price Comparison Agent
 ### Hackathon Prototype | Agentic AI Chrome Extension
 
 > **Autonomously** compares your grocery cart across Zepto, Blinkit & Swiggy Instamart using an LLM-powered agent loop — all using your **existing browser sessions** (no login needed).
@@ -41,7 +41,7 @@ Plan → Act → Observe → Adapt
 1. Open Chrome → chrome://extensions
 2. Enable "Developer Mode" (top right)
 3. Click "Load unpacked"
-4. Select this folder: smartcart-extension/
+4. Select the folder
 ```
 
 ### 2. Open Grocery Sites

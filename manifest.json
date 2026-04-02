@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "SmartCart AI — Grocery Price Agent",
+  "name": "BlinkLess — Grocery Price Agent",
   "version": "7.0.1",
   "description": "Reads your Zepto cart, searches Blinkit & Swiggy for the same items, finds cheapest.",
   "permissions": ["activeTab", "scripting", "storage", "tabs"],

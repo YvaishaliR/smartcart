@@ -19,7 +19,7 @@ export class Logger {
     };
     this.logs.push(entry);
     console[level === "error" ? "error" : level === "warn" ? "warn" : "log"](
-      `[SmartCart:${this.component}] ${message}`,
+      `[BlinkLess:${this.component}] ${message}`,
       data || ""
     );
 

@@ -1,4 +1,4 @@
-// SmartCart AI v7 — Content Script
+// BlikLess — Content Script
 // NO obfuscated class names. Uses only:
 //   - data-testid attributes (stable, set by devs intentionally)
 //   - DOM structure / position
@@ -28,7 +28,7 @@
 
   // ── ZEPTO CART SCRAPER ─────────────────────────────────────────────────────
   function scrapeZeptoCart() {
-    console.log("[SmartCart v7] Scraping Zepto cart...");
+    console.log("[BlinkLess] Scraping Zepto cart...");
 
     // The qty stepper is the most reliable anchor — Zepto always uses data-testid on it
     // From actual HTML: data-testid="undefined-cart-qty"
@@ -42,16 +42,16 @@
 
     // Deduplicate
     const uniqueQtyEls = [...new Map(qtyEls.map(el => [el, el])).values()];
-    console.log("[SmartCart] qty elements found:", uniqueQtyEls.length);
+    console.log("[BlinkLess] qty elements found:", uniqueQtyEls.length);
 
     if (uniqueQtyEls.length === 0) {
       // Last resort: find stepper buttons by aria-label
       const minusBtns = document.querySelectorAll('button[aria-label="Remove"], button[aria-label="Decrease"], button[aria-label="minus"]');
-      console.log("[SmartCart] minus buttons:", minusBtns.length);
+      console.log("[BlinkLess] minus buttons:", minusBtns.length);
       if (minusBtns.length > 0) {
         return extractItemsFromButtons([...minusBtns]);
       }
-      console.log("[SmartCart] No qty elements, trying store...");
+      console.log("[BlinkLess] No qty elements, trying store...");
       return scrapeFromStore();
     }
 
@@ -60,12 +60,12 @@
       const item = extractItemFromQtyAnchor(qtyEl);
       if (item && !items.find(i => i.name === item.name)) {
         items.push(item);
-        console.log("[SmartCart] ✓", item.name, "₹" + item.price, "qty:" + item.qty, "unit:" + item.unit);
+        console.log("[BlinkLess] ✓", item.name, "₹" + item.price, "qty:" + item.qty, "unit:" + item.unit);
       }
     }
 
     if (items.length === 0) {
-      console.log("[SmartCart] Parse failed, trying store...");
+      console.log("[BlinkLess] Parse failed, trying store...");
       return scrapeFromStore();
     }
     return items;
@@ -227,7 +227,7 @@
     const img = card.querySelector("img")?.src || "";
 
     if (!name || !price) {
-      console.log("[SmartCart] ✗ Could not parse — name:", name, "price:", price,
+      console.log("[BlinkLess] ✗ Could not parse — name:", name, "price:", price,
         "card text:", card.textContent.slice(0, 100));
       return null;
     }
@@ -262,7 +262,7 @@
         const obj = JSON.parse(str);
         const found = findCartArray(obj, 0);
         if (found.length > 0 && found.length < 200) {
-          console.log("[SmartCart] Store hit:", key, found.length, "items");
+          console.log("[BlinkLess] Store hit:", key, found.length, "items");
           return found.map(i => ({ ...i, platform: "zepto" }));
         }
       } catch {}
@@ -320,7 +320,7 @@
     const deviceId = getCookie('gr_1_deviceId') || 'web';
     const accessToken = getCookie('gr_1_accessToken') || '';
 
-    console.log('[SmartCart] Blinkit lat:', lat, 'lon:', lon);
+    console.log('[BlinkLess] Blinkit lat:', lat, 'lon:', lon);
 
     return {
       'app_client': 'consumer_web',
@@ -336,7 +336,7 @@
 
   // ── SEARCH (Blinkit & Swiggy) ──────────────────────────────────────────────
   async function searchViaAPI(query) {
-    console.log(`[SmartCart] Searching "${query}" on ${PLATFORM}`);
+    console.log(`[BlinkLess] Searching "${query}" on ${PLATFORM}`);
 
     const CONFIGS = {
       blinkit: [
@@ -524,7 +524,7 @@
     for (const cfg of configs) {
       try {
         const isPost = cfg.method === "POST";
-        console.log("[SmartCart] →", cfg.method || "GET", cfg.url.split("?")[0]);
+        console.log("[BlinkLess] →", cfg.method || "GET", cfg.url.split("?")[0]);
         // Use background proxy for cross-origin requests (content scripts are limited by CORS)
         const isCross = (() => {
           try { return new URL(cfg.url, location.origin).origin !== location.origin; } catch { return false; }
@@ -545,7 +545,7 @@
         const useProxy = typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage;
         if (useProxy) {
           const pref = await proxyFetch(cfg.url, isPost ? 'POST' : 'GET', reqHeaders, reqBody);
-          if (!pref || !pref.ok) { console.log('[SmartCart] proxy HTTP', pref?.status, pref?.error || ''); continue; }
+          if (!pref || !pref.ok) { console.log('[BlinkLess] proxy HTTP', pref?.status, pref?.error || ''); continue; }
           data = pref.body;
         } else {
           const res = await fetch(cfg.url, {
@@ -554,7 +554,7 @@
             headers: reqHeaders,
             ...(isPost ? { body: reqBody } : {}),
           });
-          if (!res.ok) { console.log("[SmartCart] HTTP", res.status); continue; }
+          if (!res.ok) { console.log("[BlinkLess] HTTP", res.status); continue; }
           data = await res.json();
         }
         const raw = cfg.parse(data);
@@ -625,34 +625,34 @@
 
         const products = expanded.filter(p => p.price > 0 && p.name.length > 1);
         if (products.length > 0) {
-          console.log("[SmartCart]", PLATFORM, "→", products.length, "candidates (all variants expanded)");
+          console.log("[BlinkLess]", PLATFORM, "→", products.length, "candidates (all variants expanded)");
           return products;
         }
       } catch (e) {
-        console.log("[SmartCart] Error:", e.message);
+        console.log("[BlinkLess] Error:", e.message);
       }
     }
     // All API endpoints failed (404 or empty). Try a conservative HTML-search fallback
     try {
-      console.log("[SmartCart] Trying HTML fallback search on", location.origin);
+      console.log("[BlinkLess] Trying HTML fallback search on", location.origin);
       const htmlResults = await htmlSearchFallback(query);
       if (htmlResults && htmlResults.length > 0) {
-        console.log("[SmartCart] HTML fallback →", htmlResults.length, "results");
+        console.log("[BlinkLess] HTML fallback →", htmlResults.length, "results");
         return htmlResults;
       }
     } catch (e) {
-      console.log("[SmartCart] HTML fallback error:", e.message);
+      console.log("[BlinkLess] HTML fallback error:", e.message);
     }
     // If HTML fallback failed, try an in-page search (simulate user typing into site's search box)
     try {
-      console.log("[SmartCart] Trying in-page search fallback");
+      console.log("[BlinkLess] Trying in-page search fallback");
       const pageResults = await pageSearchFallback(query);
       if (pageResults && pageResults.length > 0) {
-        console.log("[SmartCart] In-page fallback →", pageResults.length, "results");
+        console.log("[BlinkLess] In-page fallback →", pageResults.length, "results");
         return pageResults;
       }
     } catch (e) {
-      console.log("[SmartCart] In-page fallback error:", e.message);
+      console.log("[BlinkLess] In-page fallback error:", e.message);
     }
 
     return [];
@@ -696,10 +696,10 @@
     for (const p of tryPaths) {
       try {
         const url = location.origin + p;
-        console.log(`[SmartCart] HTML fallback fetch: ${url}`);
+        console.log(`[BlinkLess] HTML fallback fetch: ${url}`);
         const res = await fetch(url, { credentials: 'include' });
         if (!res.ok) {
-          console.log('[SmartCart] HTML fallback HTTP', res.status, 'for', url);
+          console.log('[BlinkLess] HTML fallback HTTP', res.status, 'for', url);
           continue;
         }
         const txt = await res.text();
@@ -728,7 +728,7 @@
         }
         if (candidates.length > 0) return candidates;
       } catch (e) {
-        console.log('[SmartCart] HTML fallback fetch error:', e.message);
+        console.log('[BlinkLess] HTML fallback fetch error:', e.message);
       }
     }
     return [];
@@ -786,13 +786,13 @@
       };
       const navUrl = NAV_URLS[PLATFORM];
       if (navUrl) {
-        console.log('[SmartCart] Navigating to search URL:', navUrl);
+        console.log('[BlinkLess] Navigating to search URL:', navUrl);
         history.pushState({}, '', navUrl);
         window.dispatchEvent(new PopStateEvent('popstate', { state: {} }));
         const found = await waitForResultsInDOM(7000);
         if (found && found.length > 0) return found.slice(0, 8);
       }
-      console.log('[SmartCart] No visible search input found on page for in-page fallback');
+      console.log('[BlinkLess] No visible search input found on page for in-page fallback');
       return [];
     }
 
@@ -897,10 +897,10 @@
       try {
         const items = scrapeZeptoCart();
         const offers = scrapeOffers();
-        console.log("[SmartCart] Returning", items.length, "items");
+        console.log("[BlinkLess] Returning", items.length, "items");
         sendResponse({ success: true, items, offers, platform: "zepto", url: location.href });
       } catch (e) {
-        console.error("[SmartCart] Error:", e);
+        console.error("[BlinkLess] Error:", e);
         sendResponse({ success: false, items: [], offers: [], error: e.message });
       }
       return false;
@@ -920,5 +920,5 @@
     return false;
   });
 
-  console.log(`[SmartCart v7] ✓ ${PLATFORM} @ ${location.hostname}`);
+  console.log(`[BlinkLess] ✓ ${PLATFORM} @ ${location.hostname}`);
 })();

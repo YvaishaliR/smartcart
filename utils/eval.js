@@ -1,5 +1,5 @@
 // utils/eval.js
-// Evaluation & testing framework for SmartCart AI Agent
+// Evaluation & testing framework for BlinkLess Agent
 // Run with: node utils/eval.js
 
 const MOCK_CART = [
@@ -154,7 +154,7 @@ function calculateTotals(platformData) {
 
 // ── RUN TESTS ─────────────────────────────────────────────────────────────────
 function runEvals() {
-  console.log("\n🧪 SmartCart AI — Evaluation Suite");
+  console.log("\n🧪 BlinkLess — Evaluation Suite");
   console.log("=".repeat(50));
 
   let passed = 0, failed = 0;

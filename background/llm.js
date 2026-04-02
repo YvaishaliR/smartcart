@@ -62,7 +62,7 @@ export class LLMClient {
         model: this.model,
         max_tokens: options.maxTokens || 1000,
         messages: [{ role: "user", content: prompt }],
-        system: `You are SmartCart AI, an expert grocery price comparison agent for Indian quick-commerce apps (Zepto, Blinkit, Swiggy Instamart). 
+        system: `You are BlinkLess AI, an expert grocery price comparison agent for Indian quick-commerce apps (Zepto, Blinkit, Swiggy Instamart). 
 You help users find the best deals and save money on groceries. 
 Always respond concisely and practically. When asked for JSON, respond ONLY with valid JSON.`,
       }),

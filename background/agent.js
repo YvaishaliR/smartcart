@@ -1,4 +1,4 @@
-// SmartCart AI v4 — Background Agent
+// BlinkLess — Background Agent
 // Flow: Scrape Zepto cart panel → Search each item on Blinkit & Swiggy → Compare
 
 let S = {
@@ -21,9 +21,9 @@ function log(level, msg) {
   const entry = { ts: Date.now(), level, msg };
   S.logs.push(entry);
   if (S.logs.length > 500) S.logs.shift();
-  if (level === "error") console.error("[SmartCart]", msg);
-  else if (level === "warn") console.warn("[SmartCart]", msg);
-  else console.log("[SmartCart]", msg);
+  if (level === "error") console.error("[BlinkLess]", msg);
+  else if (level === "warn") console.warn("[BlinkLess]", msg);
+  else console.log("[BlinkLess]", msg);
   try { chrome.runtime.sendMessage({ type: "LOG_ENTRY", entry }); } catch {}
 }
 function bcastState() { try { chrome.runtime.sendMessage({ type: "STATE_UPDATE", state: S }); } catch {} }
@@ -92,7 +92,7 @@ async function runAgent() {
     { id:7, status:"pending", desc:"🛡️ Guardrail checks" },
   ];
   bcastState();
-  log("info", "🚀 Agent v5 started");
+  log("info", "🚀 Agent started");
 
   try {
     // 1. Plan
@@ -135,7 +135,7 @@ async function runAgent() {
         "• You're on zepto.com (not app)\n" +
         "• Cart panel is OPEN (click the cart icon 🛒 in top-right)\n" +
         "• You have items in cart\n\n" +
-        "Check browser console for [SmartCart] debug logs."
+        "Check browser console for [BlinkLess] debug logs."
       );
     }
     setPlan(3, "done");

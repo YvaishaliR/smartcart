@@ -255,7 +255,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.url === "/tools" && req.method === "GET") {
-    res.end(JSON.stringify({ tools: TOOLS, version: "1.0.0", name: "SmartCart MCP" }));
+    res.end(JSON.stringify({ tools: TOOLS, version: "1.0.0", name: "BlinkLess MCP" }));
     return;
   }
 
@@ -299,7 +299,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(3333, () => {
-  console.log("✅ SmartCart MCP Server running on http://localhost:3333");
+  console.log("✅ BlinkLess MCP Server running on http://localhost:3333");
   console.log("📡 Connecting to Chrome CDP at http://localhost:9222");
   console.log("\nAvailable tools:", TOOLS.map(t => t.name).join(", "));
   console.log("\nTo start Chrome with CDP:");
