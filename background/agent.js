@@ -1,5 +1,7 @@
 // BlinkLess — Background Agent
 // Flow: Scrape Zepto cart panel → Search each item on Blinkit & Swiggy → Compare
+importScripts("config.js");
+
 
 let S = {
   status: "idle",
@@ -496,6 +498,63 @@ async function pickBest(target, candidates) {
 // ── LLM ───────────────────────────────────────────────────────────────────────
 async function llm(prompt, opts = {}) {
   const max = opts.max || 600;
+
+  // Groq free
+try {
+  const key = typeof CONFIG !== "undefined" && CONFIG.YOUR_KEY;
+if (!key) throw new Error("No Groq key");
+  const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: { 
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${key}`
+    },
+    body: JSON.stringify({
+      model: "llama-3.1-8b-instant",  // free, very fast
+      max_tokens: max,
+      messages: [
+        { role: "system", content: "Grocery price comparison AI for India. Return only JSON when asked." },
+        { role: "user", content: prompt }
+      ]
+    })
+  });
+  if (r.ok) {
+    const d = await r.json();
+    const t = d?.choices?.[0]?.message?.content;
+    if (t) { S.llmProvider = "Groq Llama"; return t; }
+  }
+} catch {}
+
+    try {
+      const key = (typeof CONFIG !== "undefined") && CONFIG.ANTHROPIC_API_KEY;
+    if (key) {
+      const r = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": key,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        },
+        body: JSON.stringify({
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: max,
+          system: "You are a grocery price comparison AI for India. Return only JSON when asked, no markdown, no explanation.",
+          messages: [{ role: "user", content: prompt }],
+        }),
+      });
+      if (r.ok) {
+        const d = await r.json();
+        const t = d?.content?.[0]?.text;
+        if (t) { S.llmProvider = "Claude Haiku"; return t; }
+      } else {
+        const errText = await r.text();
+        log("warn", `Claude API error ${r.status}: ${errText.slice(0, 100)}`);
+      }
+    }
+  } catch (e) {
+    log("warn", `Claude fetch failed: ${e.message}`);
+  }
 
   // Chrome Gemini Nano (free, on-device)
   try {

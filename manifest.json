@@ -11,7 +11,9 @@
     "https://*.blinkit.in/*",
     "https://*.grofers.com/*",
     "https://*.swiggy.com/*",
-    "https://*.swiggy.in/*"
+    "https://*.swiggy.in/*",
+    "https://api.anthropic.com/*",
+    "https://api.groq.com/*"
   ],
   "background": { "service_worker": "background/agent.js" },
   "content_scripts": [
@@ -31,7 +33,7 @@
   ],
   "action": {
     "default_popup": "popup/popup.html",
-    "default_icon": { "16": "icons/icon16.png", "48": "icons/icon48.png", "128": "icons/icon128.png" }
+    "default_icon": { "16": "icons/profile-16.jpg", "48": "icons/profile-48.jpg", "128": "icons/profile-128.png" }
   },
-  "icons": { "16": "icons/icon16.png", "48": "icons/icon48.png", "128": "icons/icon128.png" }
+  "icons": { "16": "icons/profile-16.jpg", "48": "icons/profile-48.jpg", "128": "icons/profile-128.png" }
 }
