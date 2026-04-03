@@ -1,5 +1,7 @@
-// BlinkLess — Background Agent
-// Flow: Scrape Zepto cart panel → Search each item on Blinkit & Swiggy → Compare
+// BlinkLess — Background Agent (v8 — LLM-driven Agentic Loop)
+// The LLM now: (1) creates the execution plan, (2) picks the best platform/split,
+// (3) adapts when items are missing (retry with a new query or skip).
+// Math is used to feed structured data IN to the LLM, never to override it.
 importScripts("config.js");
 
 let S = {
@@ -9,6 +11,7 @@ let S = {
   offers: { zepto: [], blinkit: [], swiggy: [] },
   comparison: null,
   plan: [],
+  agentThoughts: [],   // ← LLM reasoning trace shown in popup
   logs: [],
   startTime: null,
   error: null,
@@ -28,9 +31,14 @@ function log(level, msg) {
   try { chrome.runtime.sendMessage({ type: "LOG_ENTRY", entry }); } catch {}
 }
 function bcastState() { try { chrome.runtime.sendMessage({ type: "STATE_UPDATE", state: S }); } catch {} }
-function setPlan(id, status) {
+function setPlan(id, status, desc) {
   const s = S.plan.find(p => p.id === id);
-  if (s) { s.status = status; bcastState(); }
+  if (s) { s.status = status; if (desc) s.desc = desc; bcastState(); }
+}
+function addThought(thought) {
+  S.agentThoughts.push({ ts: Date.now(), thought });
+  bcastState();
+  log("info", `🤔 ${thought}`);
 }
 
 // ── MESSAGES ──────────────────────────────────────────────────────────────────
@@ -73,50 +81,76 @@ chrome.runtime.onMessage.addListener((msg, _, sendResponse) => {
 
 function resetState() {
   S = { status:"idle", zeptoCart:[], prices:{zepto:{},blinkit:{},swiggy:{}},
-        offers:{zepto:[],blinkit:[],swiggy:[]}, comparison:null, plan:[], logs:[],
-        startTime:null, error:null, llmProvider:"none", tabsFound:{}, debug:{} };
+        offers:{zepto:[],blinkit:[],swiggy:[]}, comparison:null, plan:[], agentThoughts:[],
+        logs:[], startTime:null, error:null, llmProvider:"none", tabsFound:{}, debug:{} };
 }
 
-// ── MAIN ──────────────────────────────────────────────────────────────────────
+// ── MAIN AGENTIC LOOP ─────────────────────────────────────────────────────────
 async function runAgent() {
   resetState();
   S.startTime = Date.now();
   S.status = "planning";
   S.plan = [
-    { id:1, status:"active",  desc:"🧠 Plan strategy" },
-    { id:2, status:"pending", desc:"🔍 Find open grocery tabs" },
-    { id:3, status:"pending", desc:"🛒 Scrape Zepto cart panel" },
-    { id:4, status:"pending", desc:"🔄 Search items on Blinkit" },
-    { id:5, status:"pending", desc:"🔄 Search items on Swiggy" },
-    { id:6, status:"pending", desc:"🧮 Compare & recommend" },
-    { id:7, status:"pending", desc:"🛡️ Guardrail checks" },
+    { id:1, status:"active",  desc:"🧠 LLM creating execution plan" },
+    { id:2, status:"pending", desc:"🔍 Detecting open grocery tabs" },
+    { id:3, status:"pending", desc:"🛒 Scraping Zepto cart" },
+    { id:4, status:"pending", desc:"🔄 Searching competitor platforms" },
+    { id:5, status:"pending", desc:"🧮 LLM optimizing cart allocation" },
+    { id:6, status:"pending", desc:"🛡️ Guardrail checks" },
   ];
   bcastState();
-  log("info", "🚀 Agent started");
+  log("info", "🚀 Agent v8 started");
 
   try {
-    // 1. Plan
-    await llm("Reply OK", { fallback: "OK", max: 5 });
-    setPlan(1, "done");
-
-    // 2. Tabs
-    setPlan(2, "active");
+    // ── STEP 1: LLM creates the plan ─────────────────────────────────────────
+    // LLM decides which platforms to query and in what order given available tabs.
+    // This is REAL planning — the LLM can decide to skip a platform or add steps.
+    setPlan(1, "active");
     await detectTabs();
     log("info", `Tabs found: ${JSON.stringify(S.tabsFound)}`);
+
     if (!S.tabsFound.zepto) throw new Error("No Zepto tab found. Open zepto.com in a tab first.");
+
+    const availablePlatforms = Object.keys(S.tabsFound).filter(p => p !== "zepto");
+    const planPrompt = `You are an autonomous grocery price comparison agent.
+Available browser tabs: ${JSON.stringify(S.tabsFound)}
+Zepto tab is open (source cart). Competitor tabs open: ${availablePlatforms.join(", ") || "none"}.
+
+Create an execution plan. Decide:
+1. Which platforms to search (only ones with open tabs)
+2. Order of operations
+3. Whether a split-cart strategy is worth evaluating (yes if 2+ competitors open)
+
+Return JSON only:
+{
+  "platforms_to_search": ["blinkit", "swiggy"],
+  "search_order": ["blinkit", "swiggy"],
+  "evaluate_split_cart": true,
+  "reasoning": "one sentence explaining the plan"
+}`;
+
+    const planRes = await llm(planPrompt, { max: 200, fallback: JSON.stringify({ platforms_to_search: availablePlatforms, search_order: availablePlatforms, evaluate_split_cart: availablePlatforms.length >= 2, reasoning: "Search all available platforms." }) });
+    const agentPlan = parseJSON(planRes) || { platforms_to_search: availablePlatforms, search_order: availablePlatforms, evaluate_split_cart: false, reasoning: "Default plan." };
+
+    addThought(`Plan: ${agentPlan.reasoning}`);
+    addThought(`Will search: ${agentPlan.search_order.join(", ")} | Split-cart eval: ${agentPlan.evaluate_split_cart}`);
+
+    // Update step 4 desc with the actual plan
+    setPlan(4, "pending", `🔄 Searching: ${agentPlan.search_order.join(", ")}`);
+    setPlan(1, "done");
+
+    // ── STEP 2: Tabs already detected above ──────────────────────────────────
     setPlan(2, "done");
 
-    // 3. Scrape Zepto cart
+    // ── STEP 3: Scrape Zepto cart ─────────────────────────────────────────────
     setPlan(3, "active");
     S.status = "scraping";
     bcastState();
 
-    log("info", "Scraping Zepto cart...");
     const zRes = await msgTab(S.tabsFound.zepto, { type: "SCRAPE_ZEPTO_CART" }, 11000);
     S.zeptoCart = zRes?.items || [];
     S.offers.zepto = zRes?.offers || [];
     S.debug.zeptoUrl = zRes?.url || "";
-    S.debug.zeptoRaw = S.zeptoCart.length;
 
     for (const item of S.zeptoCart) {
       const unitPrice = (item.qty && item.qty > 1 && item.price > 0)
@@ -125,62 +159,75 @@ async function runAgent() {
       S.prices.zepto[item.name] = { price: unitPrice, name: item.name, inStock: true, img: item.img, qty: item.qty };
     }
 
-    log("info", `Zepto: ${S.zeptoCart.length} items — [${S.zeptoCart.map(i=>i.name).slice(0,5).join(" | ")}]`);
-
     if (S.zeptoCart.length === 0) {
       throw new Error(
         "Zepto cart appears empty.\n\nMake sure:\n" +
         "• You're on zepto.com (not app)\n" +
         "• Cart panel is OPEN (click the cart icon 🛒 in top-right)\n" +
-        "• You have items in cart\n\n" +
-        "Check browser console for [BlinkLess] debug logs."
+        "• You have items in cart"
       );
     }
+
+    log("info", `Zepto: ${S.zeptoCart.length} items — [${S.zeptoCart.map(i=>i.name).slice(0,5).join(" | ")}]`);
+    addThought(`Cart has ${S.zeptoCart.length} items. Starting search on ${agentPlan.search_order.length} platform(s).`);
     setPlan(3, "done");
 
-    // 4. Search Blinkit
+    // ── STEP 4: Search platforms (in LLM-decided order) ──────────────────────
     setPlan(4, "active");
     S.status = "searching";
     bcastState();
-    await searchOnPlatform("blinkit");
+
+    for (const platform of agentPlan.search_order) {
+      if (!S.tabsFound[platform]) {
+        log("warn", `${platform} in plan but no tab — skipping`);
+        addThought(`Skipping ${platform} — no open tab found.`);
+        continue;
+      }
+      await searchOnPlatform(platform);
+    }
     setPlan(4, "done");
 
-    // 5. Search Swiggy
+    // ── STEP 5: LLM decides the optimal strategy ─────────────────────────────
+    // This is the core agent decision. LLM receives structured price data and
+    // decides: best single platform OR split cart, with reasoning.
     setPlan(5, "active");
-    bcastState();
-    await searchOnPlatform("swiggy");
-    setPlan(5, "done");
-
-    // 6. Compare — math first, LLM only adds summary text
-    setPlan(6, "active");
     S.status = "comparing";
     bcastState();
-    S.comparison = buildComparison(); // ← this does the real math, never overridden
 
-    // LLM only writes a friendly summary — it CANNOT change bestPlatform or savings
-    try {
-      const llmRes = await llm(buildPrompt(), { max: 200 });
-      const parsed = parseJSON(llmRes);
-      if (parsed?.summary) {
-        S.comparison.summary = parsed.summary;         // ✅ only take summary text
-        S.comparison.llmEnhanced = true;
-        log("info", `LLM summary added ✓ (${S.llmProvider})`);
+    const priceMatrix = buildPriceMatrix();
+    const decisionPrompt = buildDecisionPrompt(priceMatrix, agentPlan.evaluate_split_cart);
+
+    addThought("Evaluating platform totals and split-cart combinations...");
+
+    const decisionRes = await llm(decisionPrompt, { max: 600, fallback: null });
+    const decision = parseJSON(decisionRes);
+
+    if (decision && decision.best_platform) {
+      S.comparison = buildComparisonFromDecision(decision, priceMatrix);
+      addThought(`Decision: ${decision.reasoning}`);
+      if (decision.split_strategy?.use_split) {
+        addThought(`Split cart: Buy ${decision.split_strategy.items_on_primary?.length || 0} items on ${decision.split_strategy.primary}, ${decision.split_strategy.items_on_secondary?.length || 0} items on ${decision.split_strategy.secondary}.`);
       }
-      // ❌ never do: S.comparison.recommendation = { ...parsed.recommendation }
-    } catch (e) {
-      log("warn", `LLM summary failed: ${e.message}`);
+      log("info", `LLM decision: ${decision.best_platform} | savings ₹${decision.savings_vs_zepto || 0}`);
+    } else {
+      // Fallback to rule-based if LLM fails
+      log("warn", "LLM decision failed — falling back to rule-based comparison");
+      addThought("LLM unavailable — using rule-based math fallback.");
+      S.comparison = buildRuleBasedComparison();
     }
 
-    log("info", `Best: ${S.comparison.recommendation?.bestPlatform} | Save ₹${S.comparison.recommendation?.totalSavings}`);
-    setPlan(6, "done");
+    setPlan(5, "done");
 
-    // 7. Guardrails
-    setPlan(7, "active");
+    // ── STEP 6: Guardrails ────────────────────────────────────────────────────
+    setPlan(6, "active");
     const issues = guardrails();
     S.comparison.guardrailPassed = issues.length === 0;
     S.comparison.guardrailIssues = issues;
-    if (issues.length) log("warn", `Guardrail: ${issues.join("|")}`);
-    setPlan(7, "done");
+    if (issues.length) {
+      log("warn", `Guardrail: ${issues.join("|")}`);
+      addThought(`⚠️ Guardrail flag: ${issues.join("; ")}`);
+    }
+    setPlan(6, "done");
 
     S.status = "done";
     log("info", `✅ Done in ${((Date.now()-S.startTime)/1000).toFixed(1)}s | LLM: ${S.llmProvider}`);
@@ -194,7 +241,205 @@ async function runAgent() {
   }
 }
 
-// ── SEARCH ON PLATFORM ────────────────────────────────────────────────────────
+// ── BUILD PRICE MATRIX ────────────────────────────────────────────────────────
+// Structured data fed to the LLM for decision-making
+function buildPriceMatrix() {
+  const platforms = ["zepto", "blinkit", "swiggy"];
+  const items = S.zeptoCart;
+  const matrix = {};
+
+  for (const item of items) {
+    matrix[item.name] = { qty: item.qty || 1 };
+    for (const p of platforms) {
+      const d = S.prices[p][item.name];
+      if (d?.price && d.price > 0) {
+        matrix[item.name][p] = {
+          price: d.price,
+          inStock: d.inStock !== false,
+          matchedName: d.name || item.name,
+        };
+      } else {
+        matrix[item.name][p] = { available: false, reason: d?.noTab ? "tab_not_open" : d?.notFound ? "not_found" : "unknown" };
+      }
+    }
+  }
+
+  const totals = {};
+  for (const p of platforms) {
+    let sum = 0, found = 0, missing = 0;
+    for (const item of items) {
+      const d = S.prices[p][item.name];
+      if (d?.price > 0 && d?.inStock !== false) {
+        sum += d.price * (item.qty || 1);
+        found++;
+      } else {
+        missing++;
+      }
+    }
+    totals[p] = { subtotal: Math.round(sum * 100) / 100, itemsFound: found, itemsMissing: missing };
+  }
+
+  return { items: matrix, totals, itemCount: items.length };
+}
+
+// ── LLM DECISION PROMPT ───────────────────────────────────────────────────────
+function buildDecisionPrompt(priceMatrix, evaluateSplit) {
+  return `You are an autonomous grocery optimization agent. Given price data across platforms, decide the cheapest purchase strategy.
+
+PRICE DATA:
+${JSON.stringify(priceMatrix, null, 2)}
+
+PLATFORM TOTALS (items found × price × qty):
+${JSON.stringify(priceMatrix.totals, null, 2)}
+
+INSTRUCTIONS:
+- Choose the best single platform (most items found at lowest cost).
+- If evaluate_split is true, also check if buying different items from different platforms saves money. Only recommend split if the savings are meaningful (>₹20 after accounting for 2 delivery fees of ~₹30 each).
+- If an item is missing on the best platform, note it.
+- Do NOT invent prices. Only use the numbers above.
+
+evaluate_split: ${evaluateSplit}
+
+Return JSON only (no markdown, no explanation outside JSON):
+{
+  "best_platform": "blinkit",
+  "total_on_best": 318,
+  "savings_vs_zepto": 24,
+  "items_missing_on_best": ["Amul Butter 100g"],
+  "reasoning": "Blinkit is ₹24 cheaper than Zepto for this cart and has all items in stock.",
+  "summary": "Buy from Blinkit and save ₹24. All 8 items available.",
+  "split_strategy": {
+    "use_split": false,
+    "primary": null,
+    "secondary": null,
+    "items_on_primary": [],
+    "items_on_secondary": [],
+    "split_total": null,
+    "split_savings_vs_best_single": 0,
+    "split_reasoning": "Split saves less than ₹20 after delivery fees."
+  }
+}`;
+}
+
+// ── BUILD COMPARISON FROM LLM DECISION ───────────────────────────────────────
+function buildComparisonFromDecision(decision, priceMatrix) {
+  const platforms = ["zepto", "blinkit", "swiggy"];
+  const items = S.zeptoCart;
+
+  const itemRows = items.map(item => {
+    const row = { item: item.name, qty: item.qty || 1 };
+    for (const p of platforms) {
+      const d = S.prices[p][item.name];
+      if (d?.price && d.price > 0) {
+        row[p] = { price: d.price, available: true, inStock: d.inStock !== false, unit: d.unit || "" };
+      } else {
+        row[p] = { available: false, inStock: false };
+      }
+    }
+    // Mark which platform is cheapest per item
+    const avail = platforms.filter(p => row[p]?.price > 0 && row[p]?.inStock);
+    if (avail.length > 0) {
+      row.cheapest = avail.reduce((a, b) => (row[a].price <= row[b].price ? a : b));
+    }
+    const allPrices = avail.map(p => row[p].price).filter(Boolean);
+    row.savings = allPrices.length > 1 ? Math.round(Math.max(...allPrices) - Math.min(...allPrices)) : 0;
+    return row;
+  });
+
+  const split = decision.split_strategy;
+
+  return {
+    recommendation: {
+      bestPlatform: decision.best_platform,
+      reason: decision.reasoning,
+      totalSavings: decision.savings_vs_zepto || 0,
+      totalOnBest: decision.total_on_best,
+      itemsMissingOnBest: decision.items_missing_on_best || [],
+      confidence: priceMatrix.totals[decision.best_platform]?.itemsFound >= Math.ceil(items.length * 0.7) ? "high" : "medium",
+    },
+    summary: decision.summary || decision.reasoning,
+    itemComparison: itemRows,
+    platformTotals: priceMatrix.totals,
+    splitStrategy: {
+      possible: split?.use_split || false,
+      primary: split?.primary,
+      secondary: split?.secondary,
+      itemsOnPrimary: split?.items_on_primary || [],
+      itemsOnSecondary: split?.items_on_secondary || [],
+      splitTotal: split?.split_total,
+      splitSavings: split?.split_savings_vs_best_single || 0,
+      desc: split?.use_split
+        ? `Split: ${split.items_on_primary?.length} items on ${cap(split.primary)}, ${split.items_on_secondary?.length} on ${cap(split.secondary)}. Extra savings: ₹${split.split_savings_vs_best_single}`
+        : `Buy all from ${cap(decision.best_platform)}`,
+      splitReasoning: split?.split_reasoning,
+      savings: split?.split_savings_vs_best_single || 0,
+    },
+    llmEnhanced: true,
+    llmProvider: S.llmProvider,
+    agentThoughts: S.agentThoughts,
+  };
+}
+
+// ── RULE-BASED FALLBACK (used only if LLM is completely unavailable) ──────────
+function buildRuleBasedComparison() {
+  const platforms = ["zepto", "blinkit", "swiggy"];
+  const items = S.zeptoCart;
+
+  const itemRows = items.map(item => {
+    const row = { item: item.name, qty: item.qty || 1 };
+    let minPrice = Infinity, cheapest = null;
+    for (const p of platforms) {
+      const d = S.prices[p][item.name];
+      if (d?.price && d.price > 0) {
+        const inStock = d.inStock !== false;
+        row[p] = { price: d.price, name: d.name, available: true, inStock, unit: d.unit || "" };
+        if (inStock && d.price < minPrice) { minPrice = d.price; cheapest = p; }
+      } else {
+        row[p] = { available: false, inStock: false };
+      }
+    }
+    row.cheapest = cheapest;
+    const avail = platforms.map(p => row[p]?.price).filter(Boolean);
+    row.savings = avail.length > 1 ? Math.round(Math.max(...avail) - Math.min(...avail)) : 0;
+    return row;
+  });
+
+  const totals = {};
+  for (const p of platforms) {
+    let sum = 0, found = 0, missing = 0;
+    for (const item of items) {
+      const d = S.prices[p][item.name];
+      if (d?.price > 0 && d?.inStock !== false) { sum += d.price * (item.qty || 1); found++; }
+      else { missing++; }
+    }
+    totals[p] = { subtotal: Math.round(sum*100)/100, itemsFound: found, itemsMissing: missing };
+  }
+
+  const ranked = platforms.filter(p => totals[p].itemsFound > 0)
+    .sort((a,b) => totals[b].itemsFound !== totals[a].itemsFound
+      ? totals[b].itemsFound - totals[a].itemsFound
+      : totals[a].subtotal - totals[b].subtotal);
+
+  const best = ranked[0] || "zepto";
+  const second = ranked.find(p => p !== best);
+  const savings = second ? Math.max(0, Math.round((totals[second]?.subtotal || 0) - (totals[best]?.subtotal || 0))) : 0;
+
+  return {
+    recommendation: {
+      bestPlatform: best,
+      reason: savings > 0 ? `${cap(best)} saves ₹${savings} vs ${cap(second||"others")}` : `${cap(best)} has best coverage`,
+      totalSavings: savings,
+      confidence: totals[best]?.itemsFound >= Math.ceil(items.length * 0.7) ? "high" : "medium",
+    },
+    summary: savings > 0 ? `Buy from ${cap(best)} and save ₹${savings}.` : `${cap(best)} has the best availability for your cart.`,
+    itemComparison: itemRows,
+    platformTotals: totals,
+    splitStrategy: { possible: false, desc: `Buy all from ${cap(best)}`, savings: 0 },
+    llmEnhanced: false,
+  };
+}
+
+// ── SEARCH ON PLATFORM (with LLM-driven retry for missing items) ──────────────
 async function searchOnPlatform(platform) {
   if (!S.tabsFound[platform]) {
     log("warn", `No ${platform} tab — skipping`);
@@ -210,61 +455,74 @@ async function searchOnPlatform(platform) {
       : item.name.split("|")[0].trim();
     log("info", `${platform}: searching "${searchQuery}"`);
     const res = await msgTab(S.tabsFound[platform], { type: "SEARCH_ITEM", query: searchQuery }, 11000);
-    if (res?.results?.length > 0) {
-      log("info", `  RAW ${platform} results (${res.results.length}): ${JSON.stringify(res.results.slice(0,4).map(r=>({n:r.name?.slice(0,20),u:r.unit,p:r.price})))}`);
-    }
-    if (res === null) {
-      log("warn", `${platform}: SEARCH_ITEM timed out for tab ${S.tabsFound[platform]}`);
-    } else if (res && res.success === false) {
-      log("warn", `${platform}: SEARCH_ITEM error: ${res.error || 'unknown'}`);
-    }
+    if (res === null) log("warn", `${platform}: SEARCH_ITEM timed out`);
+    else if (res?.success === false) log("warn", `${platform}: error: ${res.error || 'unknown'}`);
+
     const results = res?.results || [];
 
     if (results.length > 0) {
       const best = await pickBest(searchQuery, results);
       if (best && best.price > 0) {
-        S.prices[platform][item.name] = {
-          ...best,
-          searchedFor: item.name,
-          inStock: best.inStock !== false,
-        };
-        const stockWarn = best.inStock === false ? " ⚠️ OUT OF STOCK" : "";
-        log("info", `  → "${best.name}" ₹${best.price} ${best.unit ? "("+best.unit+")" : ""}${stockWarn}`);
+        S.prices[platform][item.name] = { ...best, searchedFor: item.name, inStock: best.inStock !== false };
+        log("info", `  → "${best.name}" ₹${best.price}${best.inStock === false ? " ⚠️ OOS" : ""}`);
       } else {
-        S.prices[platform][item.name] = { price: null, notFound: true, name: null };
-        log("warn", `  → pickBest returned no valid result on ${platform}`);
+        // LLM decides: should we retry with a simplified query?
+        const retryQuery = await llmDecideRetry(item.name, platform, results);
+        if (retryQuery) {
+          log("info", `  LLM retry query: "${retryQuery}"`);
+          const res2 = await msgTab(S.tabsFound[platform], { type: "SEARCH_ITEM", query: retryQuery }, 11000);
+          const results2 = res2?.results || [];
+          const best2 = results2.length > 0 ? await pickBest(retryQuery, results2) : null;
+          S.prices[platform][item.name] = best2?.price > 0
+            ? { ...best2, searchedFor: item.name, usedRetryQuery: retryQuery, inStock: best2.inStock !== false }
+            : { price: null, notFound: true };
+          log("info", best2?.price > 0 ? `  → Retry hit: "${best2.name}" ₹${best2.price}` : `  → Not found after retry`);
+        } else {
+          S.prices[platform][item.name] = { price: null, notFound: true };
+          log("warn", `  → pickBest returned nothing on ${platform}`);
+        }
       }
     } else {
+      // No results at all — try short query
       const shortQuery = searchQuery.split(" ").filter(w => w.length > 1).slice(0, 3).join(" ");
-      if (shortQuery !== item.name) {
+      if (shortQuery !== searchQuery) {
         log("info", `  Retry with short query: "${shortQuery}"`);
         const res2 = await msgTab(S.tabsFound[platform], { type: "SEARCH_ITEM", query: shortQuery }, 11000);
         const results2 = res2?.results || [];
         if (results2.length > 0) {
           const best2 = await pickBest(searchQuery, results2);
-          if (best2 && best2.price > 0) {
-            S.prices[platform][item.name] = {
-              ...best2,
-              searchedFor: item.name,
-              usedShortQuery: shortQuery,
-              inStock: best2.inStock !== false,
-            };
-            const stockWarn2 = best2.inStock === false ? " ⚠️ OUT OF STOCK" : "";
-            log("info", `  → "${best2.name}" ₹${best2.price} (short query match)${stockWarn2}`);
-          } else {
-            S.prices[platform][item.name] = { price: null, notFound: true, name: null };
-            log("warn", `  → short query pickBest returned no valid result on ${platform}`);
-          }
+          S.prices[platform][item.name] = best2?.price > 0
+            ? { ...best2, searchedFor: item.name, usedShortQuery: shortQuery, inStock: best2.inStock !== false }
+            : { price: null, notFound: true };
+          log("info", best2?.price > 0 ? `  → "${best2.name}" ₹${best2.price} (short query)` : `  → Not found`);
         } else {
-          S.prices[platform][item.name] = { price: null, notFound: true, name: null };
+          S.prices[platform][item.name] = { price: null, notFound: true };
           log("warn", `  → not found on ${platform}`);
         }
       } else {
-        S.prices[platform][item.name] = { price: null, notFound: true, name: null };
+        S.prices[platform][item.name] = { price: null, notFound: true };
         log("warn", `  → not found on ${platform}`);
       }
     }
     await sleep(300);
+  }
+}
+
+// LLM decides if a failed search should be retried with a different query.
+// Returns a new query string, or null to skip.
+async function llmDecideRetry(itemName, platform, badResults) {
+  try {
+    const prompt = `You are a grocery search agent. Item "${itemName}" returned bad results on ${platform}.
+Bad results (first 3): ${JSON.stringify(badResults.slice(0,3).map(r=>({n:r.name?.slice(0,30),p:r.price})))}
+
+Should we retry with a simpler query? If yes, return a shorter, more generic search query.
+Return JSON only: {"retry": true, "query": "amul milk 500ml"} or {"retry": false, "query": null}`;
+
+    const res = await llm(prompt, { max: 60, fallback: '{"retry":false,"query":null}' });
+    const parsed = parseJSON(res);
+    return (parsed?.retry && parsed?.query) ? parsed.query : null;
+  } catch {
+    return null;
   }
 }
 
@@ -283,16 +541,10 @@ async function detectTabs() {
     for (const [platform, re] of Object.entries(TAB_PATTERNS)) {
       if (re.test(tab.url) && !S.tabsFound[platform]) {
         S.tabsFound[platform] = tab.id;
-
         try {
-          await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
-            func: () => { delete window.__smartcartV7; }
-          });
+          await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => { delete window.__smartcartV7; } });
         } catch (e) { log("warn", `Guard clear failed for ${platform}: ${e?.message}`); }
-
         await sleep(150);
-
         try {
           await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content/scraper.js"] });
           log("info", `Injected scraper into ${platform} tab ${tab.id}`);
@@ -301,22 +553,17 @@ async function detectTabs() {
           delete S.tabsFound[platform];
           break;
         }
-
         await sleep(1000);
-
         try {
           const ping = await msgTab(tab.id, { type: "PING" }, 4000);
           if (!ping || ping.platform !== platform) {
-            log("warn", `PING failed for ${platform} tab ${tab.id} — got: ${JSON.stringify(ping)}`);
+            log("warn", `PING failed for ${platform} — got: ${JSON.stringify(ping)}`);
             delete S.tabsFound[platform];
           } else {
-            log("info", `✓ ${platform} tab ${tab.id} confirmed active`);
+            log("info", `✓ ${platform} tab ${tab.id} confirmed`);
             S.debug[platform] = { url: tab.url };
           }
-        } catch (e) {
-          log("warn", `Ping error for ${platform}: ${e?.message}`);
-          delete S.tabsFound[platform];
-        }
+        } catch (e) { log("warn", `Ping error for ${platform}: ${e?.message}`); delete S.tabsFound[platform]; }
         await sleep(200);
         break;
       }
@@ -324,17 +571,15 @@ async function detectTabs() {
   }
 }
 
-// ── TAB MSG ────────────────────────────────────────────────────────────────────
+// ── TAB MSG ───────────────────────────────────────────────────────────────────
 function msgTab(tabId, message, timeout = 10000) {
   return new Promise(resolve => {
     const t = setTimeout(() => { log("warn", `Tab ${tabId} msg timeout`); resolve(null); }, timeout);
     try {
       chrome.tabs.sendMessage(tabId, message, res => {
         clearTimeout(t);
-        if (chrome.runtime.lastError) {
-          log("warn", `Tab msg err: ${chrome.runtime.lastError.message}`);
-          resolve(null);
-        } else resolve(res);
+        if (chrome.runtime.lastError) { log("warn", `Tab msg err: ${chrome.runtime.lastError.message}`); resolve(null); }
+        else resolve(res);
       });
     } catch (e) { clearTimeout(t); resolve(null); }
   });
@@ -359,52 +604,42 @@ async function pickBest(target, candidates) {
 
   let pool = candidates;
 
-// FIX: exclude multipacks (2 x 100g, 5 x 125g etc.) when target is a single unit
-const targetIsMultipack = /\d+\s*x\s*\d+|pack\s*of\s*\d+|\d+\s*pack/i.test(target);
-if (!targetIsMultipack) {
-  const noMultipacks = candidates.filter(c => 
-    !/\d+\s*x\s*\d+|pack\s*of\s*\d+|\d+\s*pack/i.test(c.unit || "")
-  );
-  if (noMultipacks.length > 0) {
-    candidates = noMultipacks;  // only filter out if alternatives exist
-    log("info", `  Multipack filter: removed ${pool.length - noMultipacks.length} multipacks`);
+  const targetIsMultipack = /\d+\s*x\s*\d+|pack\s*of\s*\d+|\d+\s*pack/i.test(target);
+  if (!targetIsMultipack) {
+    const noMultipacks = candidates.filter(c => !/\d+\s*x\s*\d+|pack\s*of\s*\d+|\d+\s*pack/i.test(c.unit || ""));
+    if (noMultipacks.length > 0) {
+      candidates = noMultipacks;
+      log("info", `  Multipack filter: removed ${pool.length - noMultipacks.length} multipacks`);
+    }
   }
-}
-  log("info", `  pickBest: target="${target}" targetQty=${targetQty} targetUnit=${targetUnit} candidates=${candidates.length}`);
+
   if (targetQty && targetUnit) {
     const sizeFiltered = candidates.filter(c => {
-      const cUnitRaw = (c.unit || "").toLowerCase();
-      if (!cUnitRaw) return false;
-      const m = cUnitRaw.match(/(\d+(?:\.\d+)?)\s*(ml|g|kg|l|ltr|litre|gm|liter|gram)/i);
+      const m = (c.unit || "").toLowerCase().match(/(\d+(?:\.\d+)?)\s*(ml|g|kg|l|ltr|litre|gm|liter|gram)/i);
       if (!m) return false;
       const cQty = parseFloat(m[1]);
       const cUnit = normalizeUnit(m[2]);
       let tQty = targetQty, tUnit = targetUnit, cQtyNorm = cQty, cUnitNorm = cUnit;
-      if (tUnit === 'kg' && cUnitNorm === 'g') { tQty = tQty * 1000; tUnit = 'g'; }
-      if (tUnit === 'g' && cUnitNorm === 'kg') { cQtyNorm = cQtyNorm * 1000; cUnitNorm = 'g'; }
-      if (tUnit === 'l' && cUnitNorm === 'ml') { tQty = tQty * 1000; tUnit = 'ml'; }
-      if (tUnit === 'ml' && cUnitNorm === 'l') { cQtyNorm = cQtyNorm * 1000; cUnitNorm = 'ml'; }
+      if (tUnit === 'kg' && cUnitNorm === 'g') { tQty *= 1000; tUnit = 'g'; }
+      if (tUnit === 'g' && cUnitNorm === 'kg') { cQtyNorm *= 1000; cUnitNorm = 'g'; }
+      if (tUnit === 'l' && cUnitNorm === 'ml') { tQty *= 1000; tUnit = 'ml'; }
+      if (tUnit === 'ml' && cUnitNorm === 'l') { cQtyNorm *= 1000; cUnitNorm = 'ml'; }
       if (tUnit !== cUnitNorm) return false;
       return Math.abs(cQtyNorm - tQty) / tQty <= 0.50;
     });
     if (sizeFiltered.length > 0) {
-      log("info", `  Size filter: ${candidates.length}→${sizeFiltered.length} for "${target}" (${targetQty}${targetUnit})`);
+      log("info", `  Size filter: ${candidates.length}→${sizeFiltered.length}`);
       pool = sizeFiltered;
     } else {
-      log("warn", `  No exact size match for "${target}" (${targetQty}${targetUnit}) — picking closest from: [${candidates.map(c=>c.unit||'?').join(", ")}]`);
-      const sameUnitCandidates = candidates.filter(c => {
+      const sameUnit = candidates.filter(c => {
         const m = (c.unit || "").match(/(\d+(?:\.\d+)?)\s*(ml|g|kg|l|ltr|litre|gm|liter|gram)/i);
         if (!m) return false;
         const cUnit = normalizeUnit(m[2]);
-        let tUnit = targetUnit;
-        if (tUnit === 'l' && cUnit === 'ml') return true;
-        if (tUnit === 'ml' && cUnit === 'l') return true;
-        if (tUnit === 'kg' && cUnit === 'g') return true;
-        if (tUnit === 'g' && cUnit === 'kg') return true;
-        return cUnit === tUnit;
+        const tUnit = targetUnit;
+        return cUnit === tUnit || (tUnit === 'l' && cUnit === 'ml') || (tUnit === 'ml' && cUnit === 'l') || (tUnit === 'kg' && cUnit === 'g') || (tUnit === 'g' && cUnit === 'kg');
       });
-      if (sameUnitCandidates.length > 0) {
-        const closest = sameUnitCandidates.sort((a, b) => {
+      if (sameUnit.length > 0) {
+        const closest = sameUnit.sort((a, b) => {
           const getQty = c => {
             const m = (c.unit||"").match(/(\d+(?:\.\d+)?)\s*(ml|g|kg|l|ltr|litre|gm)/i);
             if (!m) return 999999;
@@ -419,9 +654,7 @@ if (!targetIsMultipack) {
           return Math.abs(getQty(a) - targetQty) - Math.abs(getQty(b) - targetQty);
         });
         pool = [closest[0]];
-        log("info", `  Closest size fallback: ${closest[0].unit} ${closest[0].name?.slice(0,20)}`);
       } else {
-        log("warn", `  No same-unit candidates — marking as not found`);
         return null;
       }
     }
@@ -444,36 +677,24 @@ if (!targetIsMultipack) {
     if (exactSize.length === 1) return exactSize[0];
     if (exactSize.length > 1) {
       const nameMatch = exactSize.find(c => fuzzy(c.name, cleanTarget));
-      if (nameMatch) return nameMatch;
-      return exactSize[0];
+      return nameMatch || exactSize[0];
     }
   }
 
   const idx = pool.findIndex(c => fuzzy(c.name, cleanTarget));
   if (idx >= 0) return pool[idx];
 
-  // LLM pick for product matching (this is fine — it's just choosing an index, not changing prices)
+  // LLM picks best index match
   try {
-    const llmOpts = pool.slice(0,5).map((c,i)=> i+'. '+c.name+' '+c.unit+' Rs'+c.price).join('\n');
+    const llmOpts = pool.slice(0,5).map((c,i)=> `${i}. ${c.name} ${c.unit} Rs${c.price}`).join('\n');
     const r = await llm(
-      'Target: "' + cleanTarget + '"\nOptions:\n' + llmOpts + '\nReturn JSON only: {"i":<number>} or {"i":-1} if no match',
+      `Target: "${cleanTarget}"\nOptions:\n${llmOpts}\nReturn JSON only: {"i":<number>} or {"i":-1} if no match`,
       { max: 20, fallback: '{"i":0}' }
     );
     const p = parseJSON(r);
     if (p?.i >= 0 && p.i < pool.length) return pool[p.i];
   } catch {}
 
-  if (targetQty && targetUnit) {
-    const sorted = pool
-      .filter(c => c.inStock !== false)
-      .map(c => {
-        const m = (c.unit || "").match(/(\d+(?:\.\d+)?)\s*(ml|g|kg|l|ltr|litre|gm)/i);
-        const qty = m ? parseFloat(m[1]) : 0;
-        return { c, score: Math.abs(qty - targetQty) };
-      })
-      .sort((a, b) => a.score - b.score);
-    if (sorted.length > 0) return sorted[0].c;
-  }
   return pool.filter(c => c.inStock !== false)[0] || pool[0];
 }
 
@@ -481,22 +702,19 @@ if (!targetIsMultipack) {
 async function llm(prompt, opts = {}) {
   const max = opts.max || 600;
 
-  // 1. Groq (free, fast) ─────────────────────────────────────────────────────
+  // 1. Groq (free, fast)
   try {
-    const key = typeof CONFIG !== "undefined" && CONFIG.GROQ_API_KEY;  // ← must match config.js
+    const key = typeof CONFIG !== "undefined" && CONFIG.GROQ_API_KEY;
     if (!key) throw new Error("No Groq key");
     log("info", "Trying Groq...");
     const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${key}`           // ← backticks, not quotes
-      },
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${key}` },
       body: JSON.stringify({
         model: "llama-3.1-8b-instant",
         max_tokens: max,
         messages: [
-          { role: "system", content: "Grocery price comparison AI for India. Return only JSON when asked, no markdown." },
+          { role: "system", content: "Grocery price comparison AI for India. Return only JSON when asked, no markdown, no explanation." },
           { role: "user", content: prompt }
         ]
       })
@@ -509,11 +727,9 @@ async function llm(prompt, opts = {}) {
       const errText = await r.text();
       log("warn", `Groq error ${r.status}: ${errText.slice(0, 120)}`);
     }
-  } catch (e) {
-    log("warn", `Groq fetch failed: ${e.message}`);
-  }
+  } catch (e) { log("warn", `Groq fetch failed: ${e.message}`); }
 
-  // 2. Claude (if you top up credits) ───────────────────────────────────────
+  // 2. Claude Haiku
   try {
     const key = typeof CONFIG !== "undefined" && CONFIG.ANTHROPIC_API_KEY;
     if (key) {
@@ -541,11 +757,9 @@ async function llm(prompt, opts = {}) {
         log("warn", `Claude API error ${r.status}: ${errText.slice(0, 100)}`);
       }
     }
-  } catch (e) {
-    log("warn", `Claude fetch failed: ${e.message}`);
-  }
+  } catch (e) { log("warn", `Claude fetch failed: ${e.message}`); }
 
-  // 3. Chrome Gemini Nano (on-device, no key needed) ─────────────────────────
+  // 3. Chrome Gemini Nano (on-device)
   try {
     if (self.ai?.languageModel) {
       const cap = await self.ai.languageModel.capabilities();
@@ -559,102 +773,10 @@ async function llm(prompt, opts = {}) {
     }
   } catch {}
 
-  // 4. Rule-based fallback ───────────────────────────────────────────────────
+  // 4. Rule-based fallback
   log("warn", "All LLMs failed — using rule-based fallback");
   S.llmProvider = "Rule-based";
   return opts.fallback || "OK";
-}
-
-// ── BUILD COMPARISON ──────────────────────────────────────────────────────────
-function buildComparison() {
-  const platforms = ["zepto", "blinkit", "swiggy"];
-  const items = S.zeptoCart;
-
-  const itemRows = items.map(item => {
-    const row = { item: item.name, qty: item.qty || 1 };
-    let minPrice = Infinity, cheapest = null;
-    for (const p of platforms) {
-      const d = S.prices[p][item.name];
-      if (d?.price && d.price > 0) {
-        const inStock = d.inStock !== false;
-        row[p] = {
-          price: d.price,
-          name: d.name,
-          available: true,
-          inStock,
-          unit: d.unit || "",
-          outOfStock: !inStock,
-        };
-        if (inStock && d.price < minPrice) { minPrice = d.price; cheapest = p; }
-      } else {
-        const reason = d?.noTab ? "Tab not open" : d?.notFound ? "Not found" : "N/A";
-        row[p] = { available: false, inStock: false, reason };
-      }
-    }
-    row.cheapest = cheapest;
-    const avail = platforms.map(p => row[p]?.price).filter(Boolean);
-    row.savings = avail.length > 1 ? Math.round(Math.max(...avail) - Math.min(...avail)) : 0;
-    return row;
-  });
-
-  const totals = {};
-  for (const p of platforms) {
-    let sum = 0, found = 0, missing = 0;
-    for (const item of items) {
-      const d = S.prices[p][item.name];
-      if (d?.price > 0 && d?.inStock !== false) {
-        sum += d.price * (item.qty || 1); found++;
-      } else {
-        missing++;
-      }
-    }
-    totals[p] = { subtotal: Math.round(sum*100)/100, itemsFound: found, itemsMissing: missing, offers: S.offers[p] || [] };
-  }
-
-  const ranked = platforms.filter(p => totals[p].itemsFound > 0)
-    .sort((a,b) => {
-      if (totals[b].itemsFound !== totals[a].itemsFound) return totals[b].itemsFound - totals[a].itemsFound;
-      return totals[a].subtotal - totals[b].subtotal;
-    });
-
-  const best = ranked[0] || "zepto";
-  const second = ranked.find(p => p !== best);
-  const savings = second ? Math.max(0, Math.round((totals[second]?.subtotal || 0) - (totals[best]?.subtotal || 0))) : 0;
-
-  return {
-    recommendation: {
-      bestPlatform: best,
-      reason: savings > 0
-        ? `${cap(best)} saves ₹${savings} vs ${cap(second||"others")}`
-        : `${cap(best)} has best item coverage (${totals[best]?.itemsFound}/${items.length} found)`,
-      totalSavings: savings,
-      confidence: totals[best]?.itemsFound >= Math.ceil(items.length * 0.7) ? "high" : "medium",
-    },
-    itemComparison: itemRows,
-    platformTotals: totals,
-    alternatives: [],
-    splitStrategy: {
-      possible: false,
-      desc: `Buy from ${cap(best)}`,
-      savings: 0,
-    },
-  };
-}
-
-// LLM is only asked for a friendly summary — the winner is already decided by math above
-function buildPrompt() {
-  const best = S.comparison.recommendation.bestPlatform;
-  const savings = S.comparison.recommendation.totalSavings;
-  const totals = S.comparison.platformTotals;
-
-  const rows = S.zeptoCart.slice(0,10).map(item => {
-    const z = S.prices.zepto[item.name];
-    const b = S.prices.blinkit[item.name];
-    const sw = S.prices.swiggy[item.name];
-    return `${item.name}: Zepto=₹${z?.price||"N/A"} | Blinkit=₹${b?.price||"N/A"} | Swiggy=₹${sw?.price||"N/A"}`;
-  }).join("\n");
-
-  return `Grocery cart prices (India):\n${rows}\n\nZepto total: ₹${totals.zepto?.subtotal||"N/A"}\nBlinkit total: ₹${totals.blinkit?.subtotal||"N/A"}\nSwiggy total: ₹${totals.swiggy?.subtotal||"N/A"}\n\nThe cheapest platform is ${cap(best)}${savings > 0 ? `, saving ₹${savings}` : ""}. Write a short 1-2 sentence friendly summary for the user confirming this.\n\nReturn JSON only, no markdown: {"summary":"..."}`;
 }
 
 // ── GUARDRAILS ─────────────────────────────────────────────────────────────────
@@ -665,9 +787,9 @@ function guardrails() {
   if (best && !valid.includes(best)) issues.push(`Invalid platform: ${best}`);
   const totals = S.comparison?.platformTotals || {};
   const prices = Object.values(totals).map(t=>t?.subtotal).filter(v=>v>0);
-  if (prices.length>=2) {
-    const [mn,mx] = [Math.min(...prices),Math.max(...prices)];
-    if (mx>0&&(mx-mn)/mx>0.75) issues.push(`Large gap ₹${Math.round(mn)} vs ₹${Math.round(mx)}`);
+  if (prices.length >= 2) {
+    const [mn, mx] = [Math.min(...prices), Math.max(...prices)];
+    if (mx > 0 && (mx - mn) / mx > 0.75) issues.push(`Large price gap ₹${Math.round(mn)} vs ₹${Math.round(mx)} — verify manually`);
   }
   return issues;
 }
@@ -679,27 +801,12 @@ function fuzzy(a, b) {
   const ca = clean(String(a)), cb = clean(String(b));
   if (ca === cb) return true;
   if (ca.includes(cb) || cb.includes(ca)) return true;
-
   const wa = ca.split(" ").filter(w => w.length > 2);
   const wb = cb.split(" ").filter(w => w.length > 2);
   if (wa.length === 0) return false;
-
-  const VARIANT_WORDS = new Set([
-    "american", "masala", "classic", "original", "sour", "spicy", "salted",
-    "sweet", "tangy", "plain", "regular", "lite", "extra", "double", "triple",
-    "mint", "lemon", "lime", "chilli", "chili", "pepper", "garlic", "onion",
-    "cream", "cheese", "butter", "chocolate", "vanilla", "strawberry", "mango",
-    "intense", "repair", "damage", "dry", "oily", "sensitive", "skincare",
-    "front", "top", "matic", "toned", "full", "skimmed",
-    "standardised", "standardized", "pasteurised", "pasteurized",
-    "floral", "pine", "power", "plus", "ultra", "premium", "natural"
-  ]);
-
+  const VARIANT_WORDS = new Set(["american","masala","classic","original","sour","spicy","salted","sweet","tangy","plain","regular","lite","extra","double","triple","mint","lemon","lime","chilli","chili","pepper","garlic","onion","cream","cheese","butter","chocolate","vanilla","strawberry","mango","intense","repair","damage","dry","oily","sensitive","skincare","front","top","matic","toned","full","skimmed","standardised","standardized","pasteurised","pasteurized","floral","pine","power","plus","ultra","premium","natural"]);
   const targetVariants = wb.filter(w => VARIANT_WORDS.has(w));
-  for (const tv of targetVariants) {
-    if (!wa.includes(tv)) return false;
-  }
-
+  for (const tv of targetVariants) { if (!wa.includes(tv)) return false; }
   const overlap = wa.filter(w => wb.includes(w)).length;
   return overlap / Math.max(wa.length, wb.length) >= 0.5;
 }
